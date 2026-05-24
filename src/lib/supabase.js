@@ -53,7 +53,7 @@ export async function saveLog(log) {
   return data
 }
 
-export async function getRecentLogs(days = 30) {
+export async function getRecentLogs(days = 60) {
   const since = new Date()
   since.setDate(since.getDate() - days)
   const { data } = await supabase.from('daily_logs').select('*')
