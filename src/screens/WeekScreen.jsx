@@ -514,24 +514,79 @@ export default function WeekScreen({ profile }) {
   }
 
   async function runAdjustment(note) {
-    if (!weekPlan) return
     setAdjusting(true)
-    setError(null)
     setPendingAdjustment(null)
-    try {
-      const remainingDays = weekDates.filter(d => d > today)
-      if (remainingDays.length === 0) { setAdjusting(false); return }
-      const logsThisWeek = Object.values(logs)
-      const { system, user } = buildAdjustmentPrompt(profile, weekPlan, logsThisWeek, note, remainingDays)
-      const raw = await callAI(system, user, 7000)
-      const data = repairAndParseJSON(raw)
-      const updatedDays = { ...weekPlan.days, ...data.days }
-      await saveWeekPlan(weekStart, updatedDays, weekPlan.phase, weekPlan.phase_week)
-      setWeekPlan(p => ({ ...p, days: updatedDays }))
-      setAdjustmentResult(data.adjustment_applied)
-    } catch (e) {
-      setError('Adjustment failed: ' + e.message)
+    setError(null)
+
+    const remainingDays = weekDates.filter(d => d > today)
+    if (remainingDays.length === 0) { setAdjusting(false); return }
+
+    const logsThisWeek = Object.values(logs)
+    const logSummary = logsThisWeek.map(l => ({
+      date: l.date,
+      morning: l.morning_type,
+      pm: l.pm_type,
+      soreness: Object.keys(l.soreness || {}).filter(k => (l.soreness[k] || 0) > 4),
+      feel: l.overall_feel
+    }))
+
+    let updatedDays = { ...weekPlan.days }
+    let successCount = 0
+
+    for (const date of remainingDays) {
+      const dayName = new Date(date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })
+      const originalDay = weekPlan.days?.[date]
+
+      const system = `You are a personal AI fitness coach. Athlete profile:
+${ATHLETE_PROFILE}
+
+${DAY_SCHEMA}
+
+RESPOND ONLY WITH VALID JSON for exactly ONE day. Start with { end with }. No markdown.`
+
+      const user = `Generate an adjusted plan for ${date} (${dayName}).
+
+Adjustment note from athlete: "${note}"
+
+What has been done this week already:
+${JSON.stringify(logSummary)}
+
+Original plan for ${date} (modify this based on the adjustment):
+Label: ${originalDay?.label || 'unknown'}
+Morning type: ${originalDay?.morning?.type || 'mobility'}
+Afternoon type: ${originalDay?.afternoon?.type || 'training'}
+Muscle groups: ${JSON.stringify(originalDay?.afternoon?.muscle_groups || [])}
+
+Return ONLY the plan for ${date} as one JSON object:
+{"label":"...","day_type":"training","morning":{...},"afternoon":{...}}`
+
+      try {
+        const raw = await callAI(system, user, 1500)
+        const dayPlan = repairAndParseJSON(raw)
+        updatedDays[date] = { ...dayPlan, date }
+        successCount++
+      } catch (e) {
+        console.error(`Failed to adjust ${date}:`, e.message)
+        // Keep original plan for this day — don't break the whole adjustment
+      }
     }
+
+    if (successCount > 0) {
+      try {
+        await saveWeekPlan(weekStart, updatedDays, weekPlan.phase, weekPlan.phase_week)
+        setWeekPlan(p => ({ ...p, days: updatedDays }))
+        setAdjustmentResult(
+          successCount === remainingDays.length
+            ? `All ${successCount} remaining days adjusted based on: "${note}"`
+            : `${successCount} of ${remainingDays.length} days adjusted. Others kept original plan.`
+        )
+      } catch (e) {
+        setError('Adjusted but failed to save: ' + e.message)
+      }
+    } else {
+      setError('Adjustment failed for all days. Your original plan is intact.')
+    }
+
     setAdjusting(false)
   }
 
@@ -614,16 +669,19 @@ export default function WeekScreen({ profile }) {
         )}
 
         {adjusting && (
-          <div className="card" style={{ background: C.yellowSoft, border: `1px solid ${C.yellow}44`, textAlign: 'center' }}>
-            <div style={{ fontSize: 13, color: C.yellow }}>⚡ Adjusting remaining week...</div>
+          <div className="card" style={{ background: C.yellowSoft, border: `1px solid ${C.yellow}44`, textAlign: 'center', padding: '20px 18px' }}>
+            <div style={{ fontSize: 20, marginBottom: 8 }}>⚡</div>
+            <div style={{ fontSize: 14, color: C.yellow, fontWeight: 600, marginBottom: 4 }}>Adjusting your week...</div>
+            <div style={{ fontSize: 12, color: C.muted }}>Rebuilding each remaining day one at a time</div>
           </div>
         )}
 
         {adjustmentResult && (
           <div className="card" style={{ background: C.greenSoft, border: `1px solid ${C.green}44` }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: C.green, marginBottom: 4 }}>✓ WEEK ADJUSTED</div>
-            <div style={{ fontSize: 12, color: '#aaa' }}>{adjustmentResult}</div>
-            <button onClick={() => setAdjustmentResult(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 11, cursor: 'pointer', marginTop: 6, padding: 0 }}>Dismiss</button>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.green, marginBottom: 6 }}>✓ WEEK ADJUSTED</div>
+            <div style={{ fontSize: 13, color: '#ddd', lineHeight: 1.6, marginBottom: 8 }}>{adjustmentResult}</div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>Tap the day tabs above to see your updated sessions.</div>
+            <button onClick={() => setAdjustmentResult(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 11, cursor: 'pointer', padding: 0 }}>Dismiss</button>
           </div>
         )}
 
