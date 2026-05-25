@@ -2,68 +2,100 @@ import { useState, useEffect } from 'react'
 import { C, getWeekStart, DAYS_FULL, PHASES, getPhaseWeek } from '../lib/constants.js'
 import { ATHLETE_PROFILE } from '../lib/constants.js'
 import { getMealPlan, saveMealPlan, getWeekPlan } from '../lib/supabase.js'
-import { callAIJSON } from '../lib/ai.js'
+import { callAI } from '../lib/ai.js'
+
+// ─── JSON repair ─────────────────────────────────────────────────────────────
+
+function repairAndParseJSON(raw) {
+  const start = raw.indexOf('{')
+  const end = raw.lastIndexOf('}')
+  if (start === -1 || end === -1) throw new Error('No JSON object found in AI response')
+  let jsonStr = raw.slice(start, end + 1)
+  try { return JSON.parse(jsonStr) } catch (e1) {
+    jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1')
+    try { return JSON.parse(jsonStr) } catch (e2) {
+      throw new Error(`Parse failed after repair attempt: ${e1.message}`)
+    }
+  }
+}
+
+// ─── Prompt ───────────────────────────────────────────────────────────────────
+
+const MEAL_SCHEMA = `Each day in "days" must use this exact structure:
+{
+  "day_type": "training",
+  "calories": 2600,
+  "protein_g": 205,
+  "meals": [
+    {"name": "Post-Morning Workout", "time": "7am", "foods": ["3 eggs scrambled", "2 turkey sausage links", "1 cup Greek yogurt"], "protein_g": 50, "cal": 420, "notes": "eat within 30min of finishing"},
+    {"name": "Lunch", "time": "12pm", "foods": ["ground beef bowl with rice", "side of cottage cheese"], "protein_g": 55, "cal": 600},
+    {"name": "Pre-Workout", "time": "1:30pm", "foods": ["banana", "string cheese"], "protein_g": 10, "cal": 200},
+    {"name": "Post-Workout Dinner", "time": "5:30pm", "foods": ["grilled chicken breast", "sweet potato", "spinach"], "protein_g": 55, "cal": 650},
+    {"name": "Late Night Snack", "time": "9pm", "foods": ["Greek yogurt with berries", "rice cakes"], "protein_g": 25, "cal": 220, "notes": "healthy munchies — keep it here, stop after this"}
+  ]
+}
+Keep foods simple — 2-4 items per meal. No recipes. Real foods only. Vary across days.`
 
 function buildMealPrompt(profile, weekStart, weekPlan) {
   const phase = PHASES.find(p => p.id === profile.phase) || PHASES[0]
-  const system = `You are a personal nutrition AI coach. Athlete profile:\n${ATHLETE_PROFILE}\nCurrent weight: ${profile.weight_lbs}lbs. Phase: ${phase.label}.\nRespond ONLY with valid JSON starting with { and ending with }.`
+  const prefs = profile.preferences || {}
 
   const days = []
   for (let i = 0; i < 7; i++) {
     const d = new Date(weekStart + 'T12:00:00')
     d.setDate(d.getDate() + i)
-    days.push(d.toISOString().split('T')[0])
+    days.push({ date: d.toISOString().split('T')[0], name: DAYS_FULL[d.getDay()] })
   }
 
-  const trainingDays = weekPlan ? Object.entries(weekPlan.days || {}).filter(([, v]) => v.day_type === 'training').map(([k]) => k) : days.slice(0, 5)
-  const recoveryDays = days.filter(d => !trainingDays.includes(d))
+  const trainingDates = weekPlan
+    ? days.filter(d => weekPlan.days?.[d.date]?.day_type === 'training').map(d => d.date)
+    : days.slice(1, 6).map(d => d.date)
+  const recoveryDates = days.map(d => d.date).filter(d => !trainingDates.includes(d))
 
-  const user = `Generate a complete weekly meal plan for the week starting ${weekStart}.
+  const system = `You are a personal nutrition AI coach. Athlete profile:
+${ATHLETE_PROFILE}
+Current weight: ${profile.weight_lbs}lbs. Phase: ${phase.label}.
 
-Training days (higher carbs/calories): ${trainingDays.join(', ')}
-Recovery days (slightly lower calories): ${recoveryDays.join(', ')}
+${MEAL_SCHEMA}
 
-Rules:
-- High protein every day (~200g)
-- Training days: ~2600 cal | Recovery days: ~2200 cal
-- Use preferred foods: beef, eggs, sausage, chicken, Oikos Greek yogurt
-- Include healthy late-night snack every day (munchies prevention)
-- Practical meals — not complicated recipes
-- Vary meals day-to-day so it doesn't get boring
-- Post-workout meals should be high protein + carbs
-- Pre-workout meals should be light and energizing
+RESPOND ONLY WITH VALID JSON. Start with { end with }. No markdown, no explanation.`
 
-Return JSON:
+  const user = `Generate a complete 7-day meal plan for week starting ${weekStart}.
+
+TRAINING DAYS (2600 cal / 205g protein): ${trainingDates.join(', ') || 'Mon-Fri'}
+RECOVERY DAYS (2200 cal / 185g protein): ${recoveryDates.join(', ') || 'Sat-Sun'}
+
+RULES:
+- Preferred foods: beef, eggs, sausage, chicken, Oikos Greek yogurt
+- High protein every day, ~200g avg
+- Post-workout meals: protein + carbs
+- Pre-workout: light and energizing
+- Late night snack every day — healthy but satisfying
+- Vary meals across the 7 days, don't repeat the same thing daily
+
+DAYS: ${days.map(d => `${d.date} (${d.name})`).join(', ')}
+
+Return this JSON structure:
 {
   "week_start": "${weekStart}",
   "weekly_protein_avg": 200,
   "weekly_cal_avg": 2400,
   "days": {
-    "${days[0]}": {
-      "day_type": "training|recovery",
-      "calories": 2600,
-      "protein_g": 205,
-      "meals": [
-        {"name": "Post-Morning Workout", "time": "~7am", "foods": ["2 eggs scrambled", "3 strips turkey sausage", "1 cup Greek yogurt"], "protein_g": 45, "cal": 400, "notes": ""},
-        {"name": "Lunch", "time": "12pm", "foods": [], "protein_g": 50, "cal": 550},
-        {"name": "Pre-Workout Snack", "time": "1:30pm", "foods": [], "protein_g": 25, "cal": 250},
-        {"name": "Post-Workout Dinner", "time": "5pm", "foods": [], "protein_g": 55, "cal": 700},
-        {"name": "Late Night Snack", "time": "9-10pm", "foods": [], "protein_g": 25, "cal": 200, "notes": "healthy munchies option"}
-      ]
-    }
-    ${days.slice(1).map(d => `,"${d}": { same structure }`).join('\n')}
+    ${days.map(d => `"${d.date}": { day structure for ${d.name} }`).join(',\n    ')}
   },
   "grocery_list": {
-    "proteins": ["2 lbs ground beef", "12 eggs", "2 lbs chicken breast"],
-    "dairy": ["6 Oikos Greek yogurt cups"],
-    "produce": ["spinach", "bananas", "sweet potatoes"],
-    "pantry": ["oats", "rice", "olive oil"],
-    "snacks": ["rice cakes", "string cheese", "cottage cheese"]
+    "proteins": ["2 lbs ground beef", "12 eggs", "2 lbs chicken breast", "turkey sausage"],
+    "dairy": ["6 Oikos Greek yogurt", "cottage cheese"],
+    "produce": ["spinach", "bananas", "sweet potatoes", "berries"],
+    "pantry": ["rice", "oats", "olive oil"],
+    "snacks": ["rice cakes", "string cheese"]
   }
 }`
 
   return { system, user }
 }
+
+// ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function MealScreen({ profile }) {
   const weekStart = getWeekStart()
@@ -75,14 +107,12 @@ export default function MealScreen({ profile }) {
   const [groceryOpen, setGroceryOpen] = useState(false)
   const [checkedItems, setCheckedItems] = useState({})
 
-  useEffect(() => {
-    loadPlans()
-  }, [])
+  useEffect(() => { loadPlans() }, [])
 
   async function loadPlans() {
     const [meal, week] = await Promise.all([getMealPlan(weekStart), getWeekPlan(weekStart)])
-    setMealPlan(meal)
-    setWeekPlan(week)
+    if (meal) setMealPlan(meal)
+    if (week) setWeekPlan(week)
   }
 
   async function generateMealPlan() {
@@ -90,9 +120,15 @@ export default function MealScreen({ profile }) {
     setError(null)
     try {
       const { system, user } = buildMealPrompt(profile, weekStart, weekPlan)
-      const data = await callAIJSON(system, user, 5000)
+      const raw = await callAI(system, user, 6000)
+      const data = repairAndParseJSON(raw)
       await saveMealPlan(weekStart, data.days, data.grocery_list)
-      setMealPlan({ days: data.days, grocery_list: data.grocery_list, weekly_protein_avg: data.weekly_protein_avg, weekly_cal_avg: data.weekly_cal_avg })
+      setMealPlan({
+        days: data.days,
+        grocery_list: data.grocery_list,
+        weekly_protein_avg: data.weekly_protein_avg,
+        weekly_cal_avg: data.weekly_cal_avg,
+      })
     } catch (e) {
       setError(e.message)
     }
@@ -112,6 +148,7 @@ export default function MealScreen({ profile }) {
   }
 
   const dayData = mealPlan?.days?.[selectedDay]
+  const today = new Date().toISOString().split('T')[0]
 
   return (
     <div className="screen">
@@ -119,7 +156,11 @@ export default function MealScreen({ profile }) {
         <div style={{ fontWeight: 800, fontSize: 17 }}>🥗 Meal Plan</div>
         <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
           Week of {new Date(weekStart + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-          {mealPlan && <span style={{ color: C.green, marginLeft: 8 }}>· ~{mealPlan.weekly_cal_avg} cal · {mealPlan.weekly_protein_avg}g protein/day</span>}
+          {mealPlan && (
+            <span style={{ color: C.green, marginLeft: 8 }}>
+              · ~{mealPlan.weekly_cal_avg} cal · {mealPlan.weekly_protein_avg}g protein/day
+            </span>
+          )}
         </div>
       </div>
 
@@ -128,8 +169,12 @@ export default function MealScreen({ profile }) {
           <div className="card" style={{ textAlign: 'center', padding: '28px 18px' }}>
             <div style={{ fontSize: 32, marginBottom: 12 }}>🍳</div>
             <div style={{ fontWeight: 700, marginBottom: 6 }}>No Meal Plan Yet</div>
-            <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>AI will generate your full week of meals and a grocery list based on your training schedule.</div>
-            <button className="btn-primary" onClick={generateMealPlan} style={{ width: 'auto', padding: '12px 28px', marginBottom: 0 }}>Generate Meal Plan ⚡</button>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>
+              AI will build your full week of meals and a grocery list based on your training schedule.
+            </div>
+            <button className="btn-primary" onClick={generateMealPlan} style={{ width: 'auto', padding: '12px 28px', marginBottom: 0 }}>
+              Generate Meal Plan ⚡
+            </button>
           </div>
         )}
 
@@ -142,8 +187,14 @@ export default function MealScreen({ profile }) {
 
         {error && (
           <div className="card" style={{ background: C.redSoft, border: `1px solid ${C.red}44` }}>
-            <div style={{ fontSize: 13, color: C.red, marginBottom: 10 }}>⚠️ {error}</div>
-            <button className="btn-primary" onClick={generateMealPlan}>Retry</button>
+            <div style={{ fontSize: 13, color: C.red, marginBottom: 6 }}>⚠️ {error}</div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>
+              {mealPlan ? 'Your existing meal plan is still intact.' : 'Tap retry to try again.'}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn-primary" onClick={generateMealPlan} style={{ margin: 0 }}>Retry</button>
+              <button className="btn-secondary" onClick={() => setError(null)} style={{ margin: 0 }}>Dismiss</button>
+            </div>
           </div>
         )}
 
@@ -153,8 +204,8 @@ export default function MealScreen({ profile }) {
             <div style={{ display: 'flex', overflowX: 'auto', gap: 8, padding: '0 16px 12px', scrollbarWidth: 'none' }}>
               {days.map((date, i) => {
                 const isSelected = date === selectedDay
-                const isToday = date === new Date().toISOString().split('T')[0]
-                const dayMeals = mealPlan.days?.[date]
+                const isToday = date === today
+                const hasMeals = !!mealPlan.days?.[date]
                 return (
                   <button key={date} onClick={() => setSelectedDay(date)} style={{
                     flexShrink: 0, background: isSelected ? C.accent : C.surface,
@@ -165,7 +216,9 @@ export default function MealScreen({ profile }) {
                     <div style={{ fontSize: 13, fontWeight: 700, color: isSelected ? '#fff' : C.text }}>
                       {new Date(date + 'T12:00:00').getDate()}
                     </div>
-                    {dayMeals && <div style={{ width: 4, height: 4, borderRadius: '50%', background: isSelected ? '#fff' : C.green, margin: '3px auto 0' }} />}
+                    {hasMeals && (
+                      <div style={{ width: 4, height: 4, borderRadius: '50%', background: isSelected ? '#fff' : C.green, margin: '3px auto 0' }} />
+                    )}
                   </button>
                 )
               })}
@@ -177,27 +230,38 @@ export default function MealScreen({ profile }) {
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 14 }}>
                   <div style={{ fontWeight: 700, fontSize: 15 }}>
                     {new Date(selectedDay + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })}
+                    <span style={{ fontSize: 11, color: dayData.day_type === 'training' ? C.accent : C.green, marginLeft: 8, fontWeight: 400 }}>
+                      {dayData.day_type === 'training' ? 'Training day' : 'Recovery day'}
+                    </span>
                   </div>
-                  <div style={{ fontSize: 12, color: C.muted }}>
-                    {dayData.calories} cal · {dayData.protein_g}g protein
+                  <div style={{ fontSize: 12, color: C.muted, textAlign: 'right' }}>
+                    <div>{dayData.calories} cal</div>
+                    <div>{dayData.protein_g}g protein</div>
                   </div>
                 </div>
+
                 {dayData.meals?.map((meal, i) => (
-                  <div key={i} style={{ marginBottom: 16, paddingBottom: 16, borderBottom: i < dayData.meals.length - 1 ? `1px solid ${C.surfaceAlt}` : 'none' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
+                  <div key={i} style={{ marginBottom: 18, paddingBottom: 18, borderBottom: i < dayData.meals.length - 1 ? `1px solid ${C.surfaceAlt}` : 'none' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 5 }}>
                       <div style={{ fontWeight: 700, fontSize: 13, color: C.green }}>{meal.name}</div>
-                      <div style={{ fontSize: 11, color: C.muted, textAlign: 'right' }}>
+                      <div style={{ fontSize: 11, color: C.muted, textAlign: 'right', flexShrink: 0, marginLeft: 8 }}>
                         {meal.time && <div>{meal.time}</div>}
-                        <div>{meal.protein_g}g protein · {meal.cal} cal</div>
+                        <div>{meal.protein_g}g · {meal.cal} cal</div>
                       </div>
                     </div>
-                    <div style={{ fontSize: 13, color: '#bbb', lineHeight: 1.6 }}>{meal.foods?.join(', ')}</div>
-                    {meal.notes && <div style={{ fontSize: 12, color: C.muted, marginTop: 4, fontStyle: 'italic' }}>{meal.notes}</div>}
+                    <div style={{ fontSize: 13, color: '#bbb', lineHeight: 1.6 }}>
+                      {meal.foods?.join(' · ')}
+                    </div>
+                    {meal.notes && (
+                      <div style={{ fontSize: 12, color: C.muted, marginTop: 4, fontStyle: 'italic' }}>{meal.notes}</div>
+                    )}
                   </div>
                 ))}
               </div>
             ) : (
-              <div className="card" style={{ textAlign: 'center', color: C.muted, padding: '24px' }}>No meal data for this day.</div>
+              <div className="card" style={{ textAlign: 'center', color: C.muted, padding: '24px' }}>
+                No meal data for this day.
+              </div>
             )}
 
             {/* Grocery List */}
@@ -207,18 +271,31 @@ export default function MealScreen({ profile }) {
                   <div style={{ fontWeight: 700, fontSize: 15 }}>🛒 Grocery List</div>
                   <span style={{ color: C.muted, fontSize: 18 }}>{groceryOpen ? '↑' : '↓'}</span>
                 </div>
+
                 {groceryOpen && Object.entries(mealPlan.grocery_list).map(([category, items]) => (
                   <div key={category} style={{ marginBottom: 16 }}>
                     <div className="section-title" style={{ textTransform: 'capitalize' }}>{category}</div>
-                    {items.map((item, i) => {
+                    {Array.isArray(items) && items.map((item, i) => {
                       const key = `${category}-${item}`
                       const checked = checkedItems[key]
                       return (
-                        <div key={i} onClick={() => toggleItem(category, item)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 0', cursor: 'pointer', borderBottom: `1px solid ${C.surfaceAlt}` }}>
-                          <div style={{ width: 20, height: 20, borderRadius: 6, border: `2px solid ${checked ? C.green : C.subtle}`, background: checked ? C.green : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all 0.15s' }}>
+                        <div key={i} onClick={() => toggleItem(category, item)} style={{
+                          display: 'flex', alignItems: 'center', gap: 10,
+                          padding: '8px 0', cursor: 'pointer',
+                          borderBottom: `1px solid ${C.surfaceAlt}`
+                        }}>
+                          <div style={{
+                            width: 20, height: 20, borderRadius: 6, flexShrink: 0,
+                            border: `2px solid ${checked ? C.green : C.subtle}`,
+                            background: checked ? C.green : 'transparent',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            transition: 'all 0.15s'
+                          }}>
                             {checked && <span style={{ fontSize: 12, color: '#fff', fontWeight: 700 }}>✓</span>}
                           </div>
-                          <span style={{ fontSize: 14, color: checked ? C.muted : C.text, textDecoration: checked ? 'line-through' : 'none' }}>{item}</span>
+                          <span style={{ fontSize: 14, color: checked ? C.muted : C.text, textDecoration: checked ? 'line-through' : 'none' }}>
+                            {item}
+                          </span>
                         </div>
                       )
                     })}
@@ -228,7 +305,9 @@ export default function MealScreen({ profile }) {
             )}
 
             <div style={{ padding: '4px 16px' }}>
-              <button className="btn-secondary" onClick={generateMealPlan} disabled={generating} style={{ fontSize: 13 }}>↺ Regenerate Meal Plan</button>
+              <button className="btn-secondary" onClick={generateMealPlan} disabled={generating} style={{ fontSize: 13 }}>
+                ↺ Regenerate Meal Plan
+              </button>
             </div>
           </>
         )}
