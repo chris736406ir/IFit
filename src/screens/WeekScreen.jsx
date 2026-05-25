@@ -4,27 +4,26 @@ import { ATHLETE_PROFILE } from '../lib/constants.js'
 import { getWeekPlan, saveWeekPlan, getLogsForWeek, getLog, saveLog, getRecentLogs } from '../lib/supabase.js'
 import { callAI } from '../lib/ai.js'
 
-// ─── JSON repair ─────────────────────────────────────────────────────────────
+// ─── JSON repair ──────────────────────────────────────────────────────────────
 
 function repairAndParseJSON(raw) {
   const start = raw.indexOf('{')
   const end = raw.lastIndexOf('}')
   if (start === -1 || end === -1) throw new Error('No JSON object found in AI response')
-  let jsonStr = raw.slice(start, end + 1)
-  try { return JSON.parse(jsonStr) } catch (e1) {
-    jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1')
-    try { return JSON.parse(jsonStr) } catch (e2) {
-      throw new Error(`Parse failed after repair attempt: ${e1.message}`)
+  let s = raw.slice(start, end + 1)
+  try { return JSON.parse(s) } catch (e1) {
+    s = s.replace(/,(\s*[}\]])/g, '$1')
+    try { return JSON.parse(s) } catch (e2) {
+      throw new Error('Parse failed after repair attempt: ' + e1.message)
     }
   }
 }
 
-// ─── History summarizer ───────────────────────────────────────────────────────
+// ─── History builder ──────────────────────────────────────────────────────────
 
 function buildHistory(logs) {
   const now = Date.now()
   const daysAgo = d => (now - new Date(d + 'T12:00:00')) / 86400000
-
   const recent = logs.filter(l => daysAgo(l.date) <= 14)
   const older = logs.filter(l => daysAgo(l.date) > 14 && daysAgo(l.date) <= 60)
 
@@ -44,7 +43,6 @@ function buildHistory(logs) {
     avg_sleep: (wLogs.reduce((s, l) => s + (l.sleep_hours || 0), 0) / wLogs.length).toFixed(1),
     soreness_flags: [...new Set(wLogs.flatMap(l => Object.keys(l.soreness || {})))],
     adjustment_notes: wLogs.filter(l => l.adjustment_note).map(l => l.adjustment_note),
-    exercises_done: [...new Set(wLogs.flatMap(l => (l.pm_exercises || []).map(e => e.name)))].slice(0, 8),
   }))
 
   const weights = {}
@@ -63,9 +61,9 @@ function buildHistory(logs) {
   return { recent, summaries, weights }
 }
 
-// ─── Prompts ──────────────────────────────────────────────────────────────────
+// ─── Week prompt ──────────────────────────────────────────────────────────────
 
-const DAY_SCHEMA = `Each day must follow this structure exactly:
+const DAY_SCHEMA = `Each day must follow this structure:
 {
   "label": "Monday - Push Day",
   "day_type": "training",
@@ -74,30 +72,22 @@ const DAY_SCHEMA = `Each day must follow this structure exactly:
     "duration_min": 30,
     "type": "mobility",
     "focus": "hip flexors, glute activation",
-    "exercises": [
-      {"name": "90/90 Hip Stretch", "sets": 3, "reps": "60s each side", "notes": "keep spine tall"}
-    ],
-    "notes": "one coaching tip for the morning"
+    "exercises": [{"name":"90/90 Hip Stretch","sets":3,"reps":"60s each side","notes":"keep spine tall"}],
+    "notes": "one coaching tip"
   },
   "afternoon": {
     "label": "Push - Chest, Shoulders, Triceps",
     "duration_min": 90,
     "type": "push",
     "focus": "hypertrophy",
-    "muscle_groups": ["Chest", "Shoulders", "Triceps"],
-    "warmup": [
-      {"name": "Band pull-aparts", "duration": "2 sets of 15"}
-    ],
-    "exercises": [
-      {"name": "DB Incline Press", "sets": 4, "reps": "10-12", "weight_suggestion": "70lbs RPE 7", "notes": "control the eccentric"}
-    ],
-    "finisher": {"name": "Cable lateral raise dropset", "description": "3 weights back to back, no rest"},
-    "notes": "one coaching tip for the afternoon"
+    "muscle_groups": ["Chest","Shoulders","Triceps"],
+    "warmup": [{"name":"Band pull-aparts","duration":"2 sets of 15"}],
+    "exercises": [{"name":"DB Incline Press","sets":4,"reps":"10-12","weight_suggestion":"70lbs RPE 7","notes":"control eccentric"}],
+    "finisher": {"name":"Cable lateral raise dropset","description":"3 weights back to back"},
+    "notes": "one coaching tip"
   }
 }
-
-For active recovery days (Sunday), use day_type: "active_recovery" and keep sessions light.
-Be concise: 3-4 exercises morning, 4-6 exercises afternoon, 2-3 warmup items. Do not over-explain notes.`
+Sunday = active_recovery. Be concise: 3-4 morning exercises, 4-6 afternoon exercises, 2-3 warmup items.`
 
 function buildWeekPrompt(profile, weekStart, logs) {
   const { recent, summaries, weights } = buildHistory(logs)
@@ -112,105 +102,18 @@ function buildWeekPrompt(profile, weekStart, logs) {
     days.push({ date: d.toISOString().split('T')[0], name: DAYS_FULL[d.getDay()] })
   }
 
-  const system = `You are a personal AI fitness coach. Athlete profile:
-${ATHLETE_PROFILE}
-Current weight: ${profile.weight_lbs}lbs
-Phase: ${phase.label} (Week ${phaseWeek})
-Activity targets: Swim ${prefs.swim_per_week || 2}x/week, Basketball ${prefs.basketball_per_week || 1}x/week, Kickboxing bag ${prefs.kickboxing_per_week || 3}x/week mornings.
+  const system = 'You are a personal AI fitness coach. Athlete profile:\n' + ATHLETE_PROFILE +
+    '\nCurrent weight: ' + profile.weight_lbs + 'lbs\nPhase: ' + phase.label + ' (Week ' + phaseWeek + ')' +
+    '\nActivity targets: Swim ' + (prefs.swim_per_week || 2) + 'x/week, Basketball ' + (prefs.basketball_per_week || 1) + 'x/week, Kickboxing ' + (prefs.kickboxing_per_week || 3) + 'x/week mornings.\n\n' +
+    DAY_SCHEMA + '\n\nRESPOND ONLY WITH VALID JSON. Start with { end with }. No markdown.'
 
-${DAY_SCHEMA}
-
-RESPOND ONLY WITH VALID JSON. Start with { and end with }. No markdown, no explanation, no preamble.`
-
-  const user = `Generate a complete 7-day training plan for week starting ${weekStart}.
-
-RECENT LOGS (last 14 days, full detail):
-${recent.length > 0 ? JSON.stringify(recent.map(l => ({
-  date: l.date,
-  sleep_hours: l.sleep_hours,
-  overall_feel: l.overall_feel,
-  morning_type: l.morning_type,
-  pm_exercises: l.pm_exercises,
-  pm_feel: l.pm_feel,
-  soreness: l.soreness,
-  adjustment_note: l.adjustment_note
-}))) : 'No recent history — first week.'}
-
-OLDER HISTORY SUMMARY (weeks 3-9, for pattern awareness):
-${summaries.length > 0 ? JSON.stringify(summaries) : 'None yet.'}
-
-LAST LOGGED WEIGHTS (for progressive overload — increase 2.5-5lbs or 1 rep where appropriate):
-${Object.keys(weights).length > 0 ? JSON.stringify(weights) : 'None yet — suggest starting weights based on RPE.'}
-
-DAYS TO PLAN:
-${days.map(d => `${d.date} (${d.name})`).join('\n')}
-
-RULES:
-- Sunday = active recovery only, no heavy lifting
-- Never train same muscle group on consecutive days
-- Distribute swim ${prefs.swim_per_week || 2}x, basketball ${prefs.basketball_per_week || 1}x, kickboxing ${prefs.kickboxing_per_week || 3}x morning across the week
-- Hip mobility in EVERY morning session without exception
-- Core work minimum 3 days this week
-- Account for any soreness or adjustment notes from recent logs
-
-Return this exact JSON structure:
-{
-  "week_start": "${weekStart}",
-  "phase_note": "one sentence on this week's focus",
-  "days": {
-    ${days.map(d => `"${d.date}": { day structure }`).join(',\n    ')}
-  }
-}`
-
-  return { system, user }
-}
-
-function buildAdjustmentPrompt(profile, weekPlan, logsThisWeek, adjustNote, remainingDays) {
-  const phase = PHASES.find(p => p.id === profile.phase) || PHASES[0]
-
-  const system = `You are a personal AI fitness coach. Athlete profile:\n${ATHLETE_PROFILE}\nPhase: ${phase.label}\n\n${DAY_SCHEMA}\n\nRESPOND ONLY WITH VALID JSON. Start with { end with }. No markdown.`
-
-  const remainingSummary = remainingDays.reduce((acc, d) => {
-    const day = weekPlan.days?.[d]
-    if (day) acc[d] = {
-      label: day.label,
-      day_type: day.day_type,
-      morning_type: day.morning?.type,
-      afternoon_type: day.afternoon?.type,
-      muscle_groups: day.afternoon?.muscle_groups || []
-    }
-    return acc
-  }, {})
-
-  const logSummary = logsThisWeek.map(l => ({
-    date: l.date,
-    morning: l.morning_type,
-    pm: l.pm_type,
-    soreness: Object.keys(l.soreness || {}).filter(k => (l.soreness[k] || 0) > 4),
-    feel: l.overall_feel,
-    note: l.adjustment_note
-  }))
-
-  const user = `Adjustment note: "${adjustNote}"
-
-Done this week so far:
-${JSON.stringify(logSummary)}
-
-Remaining days planned (summary only):
-${JSON.stringify(remainingSummary)}
-
-Remaining dates: ${remainingDays.join(', ')}
-
-Modify ONLY the days that actually need changing. Skip days that are fine as-is.
-Logic: swam/ran unexpectedly = reduce that activity; sore body part = remove/delay that muscle group; injury = avoid movement pattern; felt great = push harder on relevant days.
-
-Return ONLY the modified days (if 2 of 5 need changes, return just those 2):
-{
-  "adjustment_applied": "one sentence: what changed on which days and why",
-  "days": {
-    "YYYY-MM-DD": { full day structure for changed days only }
-  }
-}`
+  const user = 'Generate a 7-day training plan for week starting ' + weekStart + '.\n\n' +
+    'RECENT LOGS (last 14 days):\n' + (recent.length > 0 ? JSON.stringify(recent.map(l => ({ date: l.date, sleep_hours: l.sleep_hours, overall_feel: l.overall_feel, morning_type: l.morning_type, pm_exercises: l.pm_exercises, pm_feel: l.pm_feel, soreness: l.soreness, adjustment_note: l.adjustment_note }))) : 'No history yet.') + '\n\n' +
+    'OLDER HISTORY SUMMARY:\n' + (summaries.length > 0 ? JSON.stringify(summaries) : 'None.') + '\n\n' +
+    'LAST LOGGED WEIGHTS (increase 2.5-5lbs or 1 rep for progressive overload):\n' + (Object.keys(weights).length > 0 ? JSON.stringify(weights) : 'None yet.') + '\n\n' +
+    'DAYS: ' + days.map(d => d.date + ' (' + d.name + ')').join(', ') + '\n\n' +
+    'RULES: Sunday = active recovery only. Never same muscle group consecutive days. Distribute swim ' + (prefs.swim_per_week || 2) + 'x, basketball ' + (prefs.basketball_per_week || 1) + 'x, kickboxing ' + (prefs.kickboxing_per_week || 3) + 'x morning. Hip mobility EVERY morning. Core 3+ days.\n\n' +
+    'Return: {"week_start":"' + weekStart + '","phase_note":"...","days":{"' + days[0].date + '":{day},"' + days[1].date + '":{day},"' + days[2].date + '":{day},"' + days[3].date + '":{day},"' + days[4].date + '":{day},"' + days[5].date + '":{day},"' + days[6].date + '":{day}}}'
 
   return { system, user }
 }
@@ -221,16 +124,25 @@ function ExerciseList({ exercises, color }) {
   if (!exercises?.length) return null
   return (
     <div>
-      {exercises.map((ex, i) => (
-        <div key={i} style={{ marginBottom: 12, paddingBottom: 12, borderBottom: i < exercises.length - 1 ? `1px solid ${C.surfaceAlt}` : 'none' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-            <div style={{ fontWeight: 600, fontSize: 14, flex: 1, paddingRight: 8 }}>{ex.name}</div>
-            <div style={{ fontSize: 12, color, fontWeight: 700, whiteSpace: 'nowrap' }}>{ex.sets} × {ex.reps}</div>
+      {exercises.map((ex, i) => {
+        const isString = typeof ex === 'string'
+        return (
+          <div key={i} style={{ marginBottom: 12, paddingBottom: 12, borderBottom: i < exercises.length - 1 ? '1px solid ' + C.surfaceAlt : 'none' }}>
+            {isString ? (
+              <div style={{ fontSize: 14, color: C.text }}>{ex}</div>
+            ) : (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                  <div style={{ fontWeight: 600, fontSize: 14, flex: 1, paddingRight: 8 }}>{ex.name}</div>
+                  <div style={{ fontSize: 12, color, fontWeight: 700, whiteSpace: 'nowrap' }}>{ex.sets} × {ex.reps}</div>
+                </div>
+                {ex.weight_suggestion && <div style={{ fontSize: 12, color: C.orange, marginTop: 3 }}>🏋 {ex.weight_suggestion}</div>}
+                {ex.notes && <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>{ex.notes}</div>}
+              </>
+            )}
           </div>
-          {ex.weight_suggestion && <div style={{ fontSize: 12, color: C.orange, marginTop: 3 }}>🏋 {ex.weight_suggestion}</div>}
-          {ex.notes && <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>{ex.notes}</div>}
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
@@ -243,7 +155,7 @@ function SessionCard({ session, colorBadge, label, icon, defaultOpen }) {
       <div onClick={() => setOpen(!open)} style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
-            <span className="badge" style={{ background: colorBadge + '22', color: colorBadge, border: `1px solid ${colorBadge}44` }}>{icon} {label}</span>
+            <span className="badge" style={{ background: colorBadge + '22', color: colorBadge, border: '1px solid ' + colorBadge + '44' }}>{icon} {label}</span>
             <span style={{ fontSize: 12, color: C.muted }}>{session.duration_min}min</span>
           </div>
           <div style={{ fontWeight: 700, fontSize: 15 }}>{session.label}</div>
@@ -252,11 +164,15 @@ function SessionCard({ session, colorBadge, label, icon, defaultOpen }) {
         <span style={{ color: C.muted, fontSize: 20, marginTop: 2 }}>{open ? '↑' : '↓'}</span>
       </div>
       {open && (
-        <div style={{ marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+        <div style={{ marginTop: 16, borderTop: '1px solid ' + C.border, paddingTop: 14 }}>
           {session.warmup?.length > 0 && (
             <div style={{ marginBottom: 16 }}>
               <div className="section-title">Warmup</div>
-              {session.warmup.map((w, i) => <div key={i} style={{ fontSize: 13, color: '#aaa', marginBottom: 4 }}>• {w.name} — {w.duration}</div>)}
+              {session.warmup.map((w, i) => (
+                <div key={i} style={{ fontSize: 13, color: '#aaa', marginBottom: 4 }}>
+                  {typeof w === 'string' ? '• ' + w : '• ' + w.name + ' — ' + w.duration}
+                </div>
+              ))}
             </div>
           )}
           {session.exercises?.length > 0 && (
@@ -266,7 +182,7 @@ function SessionCard({ session, colorBadge, label, icon, defaultOpen }) {
             </>
           )}
           {session.finisher?.name && (
-            <div style={{ background: C.redSoft, border: `1px solid ${C.red}33`, borderRadius: 10, padding: '10px 12px', marginTop: 8 }}>
+            <div style={{ background: C.redSoft, border: '1px solid ' + C.red + '33', borderRadius: 10, padding: '10px 12px', marginTop: 8 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: C.red, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 }}>Finisher 🔥</div>
               <div style={{ fontSize: 14, fontWeight: 700 }}>{session.finisher.name}</div>
               <div style={{ fontSize: 12, color: '#aaa', marginTop: 3 }}>{session.finisher.description}</div>
@@ -311,20 +227,11 @@ function LogPanel({ date, log, dayPlan, onSave }) {
 
   async function save() {
     const entry = {
-      date,
-      sleep_hours: parseFloat(sleep),
-      energy_am: parseInt(energyAm),
-      morning_done: morningDone,
-      morning_type: morningType,
-      morning_feel: parseInt(morningFeel),
-      morning_notes: morningNotes,
-      pm_exercises: exercises,
-      pm_type: pmType,
-      pm_feel: parseInt(pmFeel),
-      pm_notes: pmNotes,
-      overall_feel: parseInt(overall),
-      soreness,
-      adjustment_note: adjustNote,
+      date, sleep_hours: parseFloat(sleep), energy_am: parseInt(energyAm),
+      morning_done: morningDone, morning_type: morningType, morning_feel: parseInt(morningFeel),
+      morning_notes: morningNotes, pm_exercises: exercises, pm_type: pmType,
+      pm_feel: parseInt(pmFeel), pm_notes: pmNotes, overall_feel: parseInt(overall),
+      soreness, adjustment_note: adjustNote,
     }
     await onSave(entry)
     setSaved(true)
@@ -365,21 +272,21 @@ function LogPanel({ date, log, dayPlan, onSave }) {
           </div>
           <Slider label="How did it feel?" value={morningFeel} onChange={setMorningFeel} color={C.orange} />
           <label className="label">Notes</label>
-          <input className="input" value={morningNotes} onChange={e => setMorningNotes(e.target.value)} placeholder="e.g. hips were tight, felt great after..." />
+          <input className="input" value={morningNotes} onChange={e => setMorningNotes(e.target.value)} placeholder="e.g. hips felt tight..." />
         </>}
       </div>
 
       <div className="card">
         <div style={{ fontWeight: 700, fontSize: 14, color: C.accent, marginBottom: 14 }}>🏋️ Afternoon Session</div>
         <div style={{ marginBottom: 14 }}>
-          <label className="label">Session type (e.g. "push day", "swam laps", "basketball and pull day")</label>
+          <label className="label">Session type (e.g. "push day", "swam laps", "basketball")</label>
           <input className="input" value={pmType} onChange={e => setPmType(e.target.value)} placeholder={dayPlan?.afternoon?.label || 'What did you do?'} />
         </div>
         {exercises.map((ex, i) => (
           <div key={i} className="card-alt" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div>
               <div style={{ fontWeight: 600, fontSize: 13 }}>{ex.name}</div>
-              <div style={{ fontSize: 12, color: C.accent }}>{ex.sets}×{ex.reps}{ex.weight ? ` @ ${ex.weight}lbs` : ''}</div>
+              <div style={{ fontSize: 12, color: C.accent }}>{ex.sets}×{ex.reps}{ex.weight ? ' @ ' + ex.weight + 'lbs' : ''}</div>
             </div>
             <button onClick={() => setExercises(exercises.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', color: C.red, cursor: 'pointer', fontSize: 20 }}>×</button>
           </div>
@@ -408,7 +315,7 @@ function LogPanel({ date, log, dayPlan, onSave }) {
         )}
         <Slider label="How did PM feel?" value={pmFeel} onChange={setPmFeel} />
         <label className="label">Notes</label>
-        <input className="input" value={pmNotes} onChange={e => setPmNotes(e.target.value)} placeholder="e.g. shoulder felt strong, went heavier than planned..." style={{ marginBottom: 0 }} />
+        <input className="input" value={pmNotes} onChange={e => setPmNotes(e.target.value)} placeholder="e.g. shoulder felt strong..." style={{ marginBottom: 0 }} />
       </div>
 
       <div className="card">
@@ -416,7 +323,7 @@ function LogPanel({ date, log, dayPlan, onSave }) {
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
           {bodyParts.map(part => (
             <button key={part} onClick={() => setSoreness(s => ({ ...s, [part]: s[part] ? undefined : 7 }))}
-              style={{ background: soreness[part] ? C.redSoft : C.surfaceAlt, border: `1px solid ${soreness[part] ? C.red : C.subtle}`, borderRadius: 20, padding: '6px 14px', fontSize: 12, color: soreness[part] ? C.red : C.muted, cursor: 'pointer', fontWeight: soreness[part] ? 700 : 400 }}>
+              style={{ background: soreness[part] ? C.redSoft : C.surfaceAlt, border: '1px solid ' + (soreness[part] ? C.red : C.subtle), borderRadius: 20, padding: '6px 14px', fontSize: 12, color: soreness[part] ? C.red : C.muted, cursor: 'pointer', fontWeight: soreness[part] ? 700 : 400 }}>
               {part}
             </button>
           ))}
@@ -432,13 +339,13 @@ function LogPanel({ date, log, dayPlan, onSave }) {
         ))}
       </div>
 
-      <div className="card" style={{ background: C.yellowSoft, border: `1px solid ${C.yellow}33` }}>
+      <div className="card" style={{ background: C.yellowSoft, border: '1px solid ' + C.yellow + '33' }}>
         <div style={{ fontWeight: 700, fontSize: 14, color: C.yellow, marginBottom: 6 }}>⚡ Adjustment Flag</div>
         <div style={{ fontSize: 12, color: C.muted, marginBottom: 10 }}>
-          Did something happen today that should change the rest of this week? After saving, you'll be asked to confirm before any changes are made.
+          Did something happen that should change the rest of this week? After saving, you can confirm the adjustment.
         </div>
         <textarea className="input" value={adjustNote} onChange={e => setAdjustNote(e.target.value)}
-          placeholder="e.g. swam 2km this morning, legs are wrecked — push leg day back&#10;e.g. tweaked left ankle, avoid jumping for a few days&#10;e.g. felt incredible today, ready to push harder the rest of the week"
+          placeholder="e.g. swam 2km this morning, legs are wrecked — push leg day back&#10;e.g. tweaked left ankle, avoid jumping&#10;e.g. felt incredible, ready to push harder"
           style={{ height: 80, resize: 'none' }} />
       </div>
 
@@ -468,6 +375,7 @@ export default function WeekScreen({ profile }) {
   const [selectedLog, setSelectedLog] = useState(null)
   const [generating, setGenerating] = useState(false)
   const [adjusting, setAdjusting] = useState(false)
+  const [adjustProgress, setAdjustProgress] = useState('')
   const [error, setError] = useState(null)
   const [tab, setTab] = useState('plan')
   const [pendingAdjustment, setPendingAdjustment] = useState(null)
@@ -535,41 +443,52 @@ export default function WeekScreen({ profile }) {
 
     for (const date of remainingDays) {
       const dayName = new Date(date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' })
-      const originalDay = weekPlan.days?.[date]
+      setAdjustProgress('Adjusting ' + dayName + '...')
 
-      const system = `You are a personal AI fitness coach. Athlete profile:
-${ATHLETE_PROFILE}
+      const orig = weekPlan.days?.[date]
+      const origInfo = orig
+        ? (orig.label + ', morning: ' + (orig.morning?.type || 'mobility') + ', afternoon: ' + (orig.afternoon?.type || 'training') + ', muscles: ' + (orig.afternoon?.muscle_groups || []).join(', '))
+        : 'no original plan'
 
-${DAY_SCHEMA}
+      const systemPrompt = 'You are a personal AI fitness coach. ' + ATHLETE_PROFILE +
+        ' CRITICAL: Respond with ONLY valid JSON. No markdown, no explanation. Start with { end with }.'
 
-RESPOND ONLY WITH VALID JSON for exactly ONE day. Start with { end with }. No markdown.`
-
-      const user = `Generate an adjusted plan for ${date} (${dayName}).
-
-Adjustment note from athlete: "${note}"
-
-What has been done this week already:
-${JSON.stringify(logSummary)}
-
-Original plan for ${date} (modify this based on the adjustment):
-Label: ${originalDay?.label || 'unknown'}
-Morning type: ${originalDay?.morning?.type || 'mobility'}
-Afternoon type: ${originalDay?.afternoon?.type || 'training'}
-Muscle groups: ${JSON.stringify(originalDay?.afternoon?.muscle_groups || [])}
-
-Return ONLY the plan for ${date} as one JSON object:
-{"label":"...","day_type":"training","morning":{...},"afternoon":{...}}`
+      const userPrompt = 'Generate an adjusted workout plan for ' + date + ' (' + dayName + ').\n' +
+        'ADJUSTMENT REASON: "' + note + '"\n' +
+        'DONE THIS WEEK: ' + JSON.stringify(logSummary) + '\n' +
+        'ORIGINAL PLAN FOR TODAY: ' + origInfo + '\n\n' +
+        'Return a single JSON object with this exact structure (exercises MUST be plain strings, not objects):\n' +
+        '{\n' +
+        '  "label": "' + dayName + ' - [session name]",\n' +
+        '  "day_type": "training",\n' +
+        '  "morning": {\n' +
+        '    "label": "session name",\n' +
+        '    "duration_min": 30,\n' +
+        '    "focus": "focus area",\n' +
+        '    "exercises": ["Exercise name 3x10", "Exercise name 3x60s each side"],\n' +
+        '    "notes": "one tip"\n' +
+        '  },\n' +
+        '  "afternoon": {\n' +
+        '    "label": "session name",\n' +
+        '    "duration_min": 90,\n' +
+        '    "focus": "focus area",\n' +
+        '    "muscle_groups": ["Group1", "Group2"],\n' +
+        '    "exercises": ["Exercise 4x10-12 @ 70lbs", "Exercise 3x8-10", "Exercise 3x15"],\n' +
+        '    "notes": "one tip"\n' +
+        '  }\n' +
+        '}'
 
       try {
-        const raw = await callAI(system, user, 1500)
+        const raw = await callAI(systemPrompt, userPrompt, 2000)
         const dayPlan = repairAndParseJSON(raw)
-        updatedDays[date] = { ...dayPlan, date }
+        updatedDays[date] = dayPlan
         successCount++
       } catch (e) {
-        console.error(`Failed to adjust ${date}:`, e.message)
-        // Keep original plan for this day — don't break the whole adjustment
+        console.error('Failed to adjust ' + date + ':', e.message)
       }
     }
+
+    setAdjustProgress('')
 
     if (successCount > 0) {
       try {
@@ -577,14 +496,14 @@ Return ONLY the plan for ${date} as one JSON object:
         setWeekPlan(p => ({ ...p, days: updatedDays }))
         setAdjustmentResult(
           successCount === remainingDays.length
-            ? `All ${successCount} remaining days adjusted based on: "${note}"`
-            : `${successCount} of ${remainingDays.length} days adjusted. Others kept original plan.`
+            ? 'All ' + successCount + ' remaining days adjusted. Tap the day tabs to see changes.'
+            : successCount + ' of ' + remainingDays.length + ' days adjusted successfully.'
         )
       } catch (e) {
         setError('Adjusted but failed to save: ' + e.message)
       }
     } else {
-      setError('Adjustment failed for all days. Your original plan is intact.')
+      setError('Could not adjust any days. Your original plan is intact.')
     }
 
     setAdjusting(false)
@@ -620,10 +539,11 @@ Return ONLY the plan for ${date} as one JSON object:
               Week of {new Date(weekStart + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
             </div>
           </div>
-          <span className="badge" style={{ background: phase.color + '22', color: phase.color, border: `1px solid ${phase.color}44` }}>
+          <span className="badge" style={{ background: phase.color + '22', color: phase.color, border: '1px solid ' + phase.color + '44' }}>
             {phase.label} · W{phaseWeek}
           </span>
         </div>
+
         <div style={{ display: 'flex', gap: 4 }}>
           {weekDates.map((date, i) => {
             const status = dayStatus(date)
@@ -632,7 +552,7 @@ Return ONLY the plan for ${date} as one JSON object:
             return (
               <button key={date} onClick={() => setSelectedDate(date)} style={{
                 flex: 1, background: isSelected ? C.accent : 'transparent',
-                border: `1px solid ${isToday && !isSelected ? C.accent : isSelected ? C.accent : C.border}`,
+                border: '1px solid ' + (isToday && !isSelected ? C.accent : isSelected ? C.accent : C.border),
                 borderRadius: 10, padding: '6px 0', cursor: 'pointer', transition: 'all 0.15s'
               }}>
                 <div style={{ fontSize: 10, color: isSelected ? '#fff' : C.muted, marginBottom: 3 }}>{DAYS[i]}</div>
@@ -651,46 +571,46 @@ Return ONLY the plan for ${date} as one JSON object:
 
       <div style={{ paddingTop: 16 }}>
 
-        {/* Pending adjustment banner */}
         {pendingAdjustment && !adjusting && (
-          <div className="card" style={{ background: C.yellowSoft, border: `1px solid ${C.yellow}44` }}>
+          <div className="card" style={{ background: C.yellowSoft, border: '1px solid ' + C.yellow + '44' }}>
             <div style={{ fontWeight: 700, fontSize: 14, color: C.yellow, marginBottom: 8 }}>⚡ Adjustment Flagged</div>
             <div style={{ fontSize: 13, color: '#ddd', marginBottom: 4, fontStyle: 'italic' }}>"{pendingAdjustment}"</div>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>Update the remaining days of this week based on this note?</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
+              Rebuild remaining {weekDates.filter(d => d > today).length} days based on this? Takes ~30 seconds.
+            </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button className="btn-primary" onClick={() => runAdjustment(pendingAdjustment)} style={{ margin: 0, flex: 1, background: C.yellow, color: '#000' }}>
-                Yes, adjust remaining week
+                Yes, adjust my week
               </button>
               <button className="btn-secondary" onClick={() => setPendingAdjustment(null)} style={{ margin: 0, flex: 1 }}>
-                No, keep as is
+                No thanks
               </button>
             </div>
           </div>
         )}
 
         {adjusting && (
-          <div className="card" style={{ background: C.yellowSoft, border: `1px solid ${C.yellow}44`, textAlign: 'center', padding: '20px 18px' }}>
+          <div className="card" style={{ background: C.yellowSoft, border: '1px solid ' + C.yellow + '44', textAlign: 'center', padding: '20px 18px' }}>
             <div style={{ fontSize: 20, marginBottom: 8 }}>⚡</div>
             <div style={{ fontSize: 14, color: C.yellow, fontWeight: 600, marginBottom: 4 }}>Adjusting your week...</div>
-            <div style={{ fontSize: 12, color: C.muted }}>Rebuilding each remaining day one at a time</div>
+            <div style={{ fontSize: 12, color: C.muted }}>{adjustProgress || 'Building each remaining day...'}</div>
           </div>
         )}
 
         {adjustmentResult && (
-          <div className="card" style={{ background: C.greenSoft, border: `1px solid ${C.green}44` }}>
+          <div className="card" style={{ background: C.greenSoft, border: '1px solid ' + C.green + '44' }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: C.green, marginBottom: 6 }}>✓ WEEK ADJUSTED</div>
-            <div style={{ fontSize: 13, color: '#ddd', lineHeight: 1.6, marginBottom: 8 }}>{adjustmentResult}</div>
-            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>Tap the day tabs above to see your updated sessions.</div>
+            <div style={{ fontSize: 13, color: '#ddd', marginBottom: 8 }}>{adjustmentResult}</div>
             <button onClick={() => setAdjustmentResult(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 11, cursor: 'pointer', padding: 0 }}>Dismiss</button>
           </div>
         )}
 
         {!weekPlan && !generating && (
-          <div className="card" style={{ textAlign: 'center', padding: '28px 18px', background: isSunday ? C.accentSoft : undefined, border: isSunday ? `1px solid ${C.accent}44` : undefined }}>
+          <div className="card" style={{ textAlign: 'center', padding: '28px 18px', background: isSunday ? C.accentSoft : undefined, border: isSunday ? '1px solid ' + C.accent + '44' : undefined }}>
             <div style={{ fontSize: 32, marginBottom: 12 }}>{isSunday ? '📅' : '🤖'}</div>
             <div style={{ fontWeight: 700, marginBottom: 6 }}>{isSunday ? "It's Sunday — Generate This Week" : 'No Plan for This Week'}</div>
             <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>
-              AI will plan your full week with progressive overload, swim days, kickboxing, and meals based on your last 60 days of history.
+              AI will plan your full week using your last 60 days of history.
             </div>
             <button className="btn-primary" onClick={generateWeek} style={{ width: 'auto', padding: '12px 28px', marginBottom: 0 }}>
               Generate Week ⚡
@@ -701,20 +621,20 @@ Return ONLY the plan for ${date} as one JSON object:
         {generating && (
           <div className="card" style={{ textAlign: 'center', padding: '24px 18px' }}>
             <div style={{ fontSize: 24, marginBottom: 10 }}>⚡</div>
-            <div style={{ fontSize: 13, color: C.muted }}>Building your 7-day plan with progressive overload and 60-day history...</div>
+            <div style={{ fontSize: 13, color: C.muted }}>Building your 7-day plan...</div>
           </div>
         )}
 
         {error && (
-          <div className="card" style={{ background: C.redSoft, border: `1px solid ${C.red}44` }}>
+          <div className="card" style={{ background: C.redSoft, border: '1px solid ' + C.red + '44' }}>
             <div style={{ fontSize: 13, color: C.red, marginBottom: 6 }}>⚠️ {error}</div>
-            <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>Your existing plan is still saved and intact in Supabase.</div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>Your existing plan is still saved and intact.</div>
             <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 12, cursor: 'pointer', padding: 0 }}>Dismiss</button>
           </div>
         )}
 
         {weekPlan?.phase_note && (
-          <div className="card" style={{ background: C.accentSoft, border: `1px solid ${C.accent}44` }}>
+          <div className="card" style={{ background: C.accentSoft, border: '1px solid ' + C.accent + '44' }}>
             <div style={{ fontSize: 12, color: '#9c8fff' }}>📍 {weekPlan.phase_note}</div>
           </div>
         )}
@@ -743,10 +663,10 @@ Return ONLY the plan for ${date} as one JSON object:
             {tab === 'plan' && (
               <>
                 {logs[selectedDate]?.overall_feel && (
-                  <div className="card" style={{ background: C.greenSoft, border: `1px solid ${C.green}44` }}>
+                  <div className="card" style={{ background: C.greenSoft, border: '1px solid ' + C.green + '44' }}>
                     <div style={{ fontSize: 12, color: C.green }}>
                       ✓ Logged · Feel: {logs[selectedDate].overall_feel}/10
-                      {logs[selectedDate].pm_type ? ` · ${logs[selectedDate].pm_type}` : ''}
+                      {logs[selectedDate].pm_type ? ' · ' + logs[selectedDate].pm_type : ''}
                     </div>
                   </div>
                 )}
@@ -756,11 +676,8 @@ Return ONLY the plan for ${date} as one JSON object:
                     <SessionCard session={selectedDay.afternoon} colorBadge={C.accent} label="Afternoon" icon="🏋️" defaultOpen={selectedDate === today} />
                   </>
                 ) : (
-                  <div className="card" style={{ textAlign: 'center', color: C.muted, padding: '24px 18px' }}>
-                    No plan for this day.
-                  </div>
+                  <div className="card" style={{ textAlign: 'center', color: C.muted, padding: '24px 18px' }}>No plan for this day.</div>
                 )}
-
               </>
             )}
 
