@@ -168,37 +168,47 @@ Return this exact JSON structure:
 function buildAdjustmentPrompt(profile, weekPlan, logsThisWeek, adjustNote, remainingDays) {
   const phase = PHASES.find(p => p.id === profile.phase) || PHASES[0]
 
-  const system = `You are a personal AI fitness coach. Athlete profile:
-${ATHLETE_PROFILE}
-Phase: ${phase.label}
+  const system = `You are a personal AI fitness coach. Athlete profile:\n${ATHLETE_PROFILE}\nPhase: ${phase.label}\n\n${DAY_SCHEMA}\n\nRESPOND ONLY WITH VALID JSON. Start with { end with }. No markdown.`
 
-${DAY_SCHEMA}
+  const remainingSummary = remainingDays.reduce((acc, d) => {
+    const day = weekPlan.days?.[d]
+    if (day) acc[d] = {
+      label: day.label,
+      day_type: day.day_type,
+      morning_type: day.morning?.type,
+      afternoon_type: day.afternoon?.type,
+      muscle_groups: day.afternoon?.muscle_groups || []
+    }
+    return acc
+  }, {})
 
-RESPOND ONLY WITH VALID JSON. Start with { and end with }. No markdown.`
+  const logSummary = logsThisWeek.map(l => ({
+    date: l.date,
+    morning: l.morning_type,
+    pm: l.pm_type,
+    soreness: Object.keys(l.soreness || {}).filter(k => (l.soreness[k] || 0) > 4),
+    feel: l.overall_feel,
+    note: l.adjustment_note
+  }))
 
-  const user = `The athlete flagged a mid-week adjustment:
+  const user = `Adjustment note: "${adjustNote}"
 
-"${adjustNote}"
+Done this week so far:
+${JSON.stringify(logSummary)}
 
-ORIGINAL WEEK PLAN (remaining days only):
-${JSON.stringify(Object.fromEntries(remainingDays.map(d => [d, weekPlan.days?.[d]]).filter(([,v]) => v)))}
+Remaining days planned (summary only):
+${JSON.stringify(remainingSummary)}
 
-LOGS SO FAR THIS WEEK:
-${JSON.stringify(logsThisWeek.map(l => ({ date: l.date, morning_type: l.morning_type, pm_type: l.pm_type, pm_exercises: l.pm_exercises, soreness: l.soreness, overall_feel: l.overall_feel, adjustment_note: l.adjustment_note })))}
+Remaining dates: ${remainingDays.join(', ')}
 
-REMAINING DAYS TO ADJUST: ${remainingDays.join(', ')}
+Modify ONLY the days that actually need changing. Skip days that are fine as-is.
+Logic: swam/ran unexpectedly = reduce that activity; sore body part = remove/delay that muscle group; injury = avoid movement pattern; felt great = push harder on relevant days.
 
-Based on the adjustment note, regenerate ONLY the remaining days. Common logic:
-- Swam unexpectedly → reduce swim frequency for remaining days
-- Sore body part → shift that work later or drop it entirely
-- Missed session → redistribute volume if possible, don't force it
-- Felt great → can add volume/intensity on relevant days
-
-Return JSON:
+Return ONLY the modified days (if 2 of 5 need changes, return just those 2):
 {
-  "adjustment_applied": "one sentence describing what changed and why",
+  "adjustment_applied": "one sentence: what changed on which days and why",
   "days": {
-    ${remainingDays.map(d => `"${d}": { full day structure }`).join(',\n    ')}
+    "YYYY-MM-DD": { full day structure for changed days only }
   }
 }`
 
@@ -513,7 +523,7 @@ export default function WeekScreen({ profile }) {
       if (remainingDays.length === 0) { setAdjusting(false); return }
       const logsThisWeek = Object.values(logs)
       const { system, user } = buildAdjustmentPrompt(profile, weekPlan, logsThisWeek, note, remainingDays)
-      const raw = await callAI(system, user, 5000)
+      const raw = await callAI(system, user, 7000)
       const data = repairAndParseJSON(raw)
       const updatedDays = { ...weekPlan.days, ...data.days }
       await saveWeekPlan(weekStart, updatedDays, weekPlan.phase, weekPlan.phase_week)
