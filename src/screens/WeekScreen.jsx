@@ -475,7 +475,7 @@ export default function WeekScreen({ profile }) {
 
   async function loadWeek() {
     const [plan, weekLogs] = await Promise.all([getWeekPlan(weekStart), getLogsForWeek(weekStart)])
-    setWeekPlan(plan)
+    if (plan) setWeekPlan(plan)
     const logMap = {}
     weekLogs.forEach(l => { logMap[l.date] = l })
     setLogs(logMap)
@@ -639,8 +639,9 @@ export default function WeekScreen({ profile }) {
 
         {error && (
           <div className="card" style={{ background: C.redSoft, border: `1px solid ${C.red}44` }}>
-            <div style={{ fontSize: 13, color: C.red, marginBottom: 10 }}>⚠️ {error}</div>
-            <button className="btn-primary" onClick={generateWeek}>Retry</button>
+            <div style={{ fontSize: 13, color: C.red, marginBottom: 6 }}>⚠️ {error}</div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>Your existing plan is still saved and intact in Supabase.</div>
+            <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 12, cursor: 'pointer', padding: 0 }}>Dismiss</button>
           </div>
         )}
 
@@ -691,9 +692,7 @@ export default function WeekScreen({ profile }) {
                     No plan for this day.
                   </div>
                 )}
-                <div style={{ padding: '4px 16px' }}>
-                  <button className="btn-secondary" onClick={generateWeek} disabled={generating} style={{ fontSize: 13 }}>↺ Regenerate Full Week</button>
-                </div>
+
               </>
             )}
 
