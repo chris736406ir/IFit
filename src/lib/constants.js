@@ -1,42 +1,42 @@
 export const ATHLETE_PROFILE = `
-ATHLETE PROFILE — use every time:
+ATHLETE PROFILE:
 - Age: 26 | Height: 6'4" | Weight: ~220lbs
-- Goal: Body recomp — reduce torso/chest fat, build arms/legs/shoulders. Feel athletic, functional, confident.
-- Experience: ~9 years lifting, intermediate, returning from 2-month break. Treat as intermediate returning from off-season.
-- Athletic: former competitive swimmer, intermediate kickboxer, loves basketball
+- Goal: Body recomp — reduce torso/chest fat, build arms/legs/shoulders. Feel athletic, functional, and confident.
+- Experience: ~9 years lifting, intermediate, returning from 2-month break.
+- Athletic background: former competitive swimmer, intermediate kickboxer, loves basketball.
 
-HOME GYM (Morning — fasted ~6am, 20-45min max):
+HOME GYM (Morning — fasted ~6am, 20-45min):
 - Full cable machine, flat bench, pullup bar, jump rope, heavy kickboxing bag
 - Purpose: mobility, activation, accessory, kickboxing — NOT heavy lifting
 
 COMMERCIAL GYM (Afternoon ~2-3pm, 90min):
-- Full free weights, all machines, cable stations, lap pool, basketball court
-- Purpose: main training session
+- Full free weights, machines, cables, lap pool, basketball court
 
-WEEKLY ACTIVITY DISTRIBUTION (build into every weekly plan):
-- Swim: 1-2x per week (morning OR afternoon cooldown, prefer Tue/Thu)
-- Basketball: 1x per week (post-workout warmup or cooldown, prefer Sat/Sun)
-- Kickboxing bag: 2-3x per week morning rounds
-- Running/jump rope: active recovery days
+WEEKLY ACTIVITY DISTRIBUTION:
+- Swim: 1-2x/week | Basketball: 1x/week | Kickboxing bag: 2-3x/week morning | Running/jump rope: recovery days
 
-DIET: High protein ~200g/day, ~2400-2600 cal.
-Preferred: beef, eggs, sausage, chicken, Oikos Greek yogurt.
-Needs healthy late-night snack options (munchies tendency).
-Not tracking calories — recommend simple whole food options.
-
-INJURIES (ALWAYS respect):
+INJURIES (always respect):
 - Left pec: NO heavy cable flyes. ALWAYS dumbbell incline over flat bench.
 - Lower back: warm up spine carefully, no reckless loading
-- Knees: ATG/KneesOverToes style — deep ROM, step-downs, tibialis work
-- Hips: VERY tight — hip mobility in EVERY morning session
+- Knees: ATG/KneesOverToes approach — deep ROM, step-downs, tibialis work
+- Hips: very tight — hip mobility in EVERY morning session
 
-ALWAYS INCLUDE:
-- Hip mobility in every single morning session
+TRAINING RULES:
+- Hip mobility every single morning
 - Core work minimum 3x/week
 - ATG-style squats/lunges for knee health
 - Dumbbell incline instead of flat bench
 - Protect lower back on all hinge movements
 - Progressive overload week over week on main lifts
+- Sunday = active recovery only
+
+NUTRITION ROLE — act as both personal trainer AND nutritionist:
+- Prioritize natural testosterone optimization through food, lifestyle, and supplements
+- Focus on recovery nutrition, sleep quality, and hormonal health
+- Whole food first, supplements fill gaps
+- High protein ~200g/day, ~2400-2600 cal (training days), ~2200 cal (recovery days)
+- Preferred foods: beef, eggs, sausage, chicken, Oikos Greek yogurt
+- Healthy late-night snack options (tendency for munchies)
 `
 
 export const PHASES = [
@@ -71,8 +71,7 @@ export const C = {
 
 export function getWeekStart(date = new Date()) {
   const d = new Date(date)
-  const day = d.getDay()
-  d.setDate(d.getDate() - day)
+  d.setDate(d.getDate() - d.getDay())
   return d.toISOString().split('T')[0]
 }
 
