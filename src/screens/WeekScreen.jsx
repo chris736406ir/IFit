@@ -1,25 +1,35 @@
 import { useState, useEffect } from 'react'
-import { C, DAYS, DAYS_FULL, getWeekStart, todayStr, getPhaseWeek, PHASES } from '../lib/constants.js'
-import { ATHLETE_PROFILE } from '../lib/constants.js'
-import { getWeekPlan, saveWeekPlan, getLogsForWeek, getLog, saveLog, getRecentLogs } from '../lib/supabase.js'
-import { callAI } from '../lib/ai.js'
+import { C, DAYS, DAYS_FULL, getWeekStart, todayStr, getPhaseWeek, PHASES, ATHLETE_PROFILE } from '../lib/constants.js'
+import { getWeekPlan, saveWeekPlan, getLogsForWeek, saveLog, getRecentLogs } from '../lib/supabase.js'
+import { callAI, repairAndParseJSON } from '../lib/ai.js'
 
-// ─── JSON repair ──────────────────────────────────────────────────────────────
+// ─── Week prompt ──────────────────────────────────────────────────────────────
 
-function repairAndParseJSON(raw) {
-  const start = raw.indexOf('{')
-  const end = raw.lastIndexOf('}')
-  if (start === -1 || end === -1) throw new Error('No JSON object found in AI response')
-  let s = raw.slice(start, end + 1)
-  try { return JSON.parse(s) } catch (e1) {
-    s = s.replace(/,(\s*[}\]])/g, '$1')
-    try { return JSON.parse(s) } catch (e2) {
-      throw new Error('Parse failed after repair attempt: ' + e1.message)
-    }
+const DAY_SCHEMA = `Each day uses this structure. Exercises and warmup are PLAIN STRINGS not objects.
+{
+  "label": "Monday - Push Day",
+  "day_type": "training",
+  "morning": {
+    "label": "Hip Mobility + Kickboxing",
+    "duration_min": 30,
+    "type": "mobility",
+    "focus": "hip flexors and glutes",
+    "exercises": ["90/90 Hip Stretch 3x60s each side", "Tibialis raise 3x20", "Kickboxing 3x2min rounds"],
+    "notes": "keep it light fasted"
+  },
+  "afternoon": {
+    "label": "Push - Chest Shoulders Triceps",
+    "duration_min": 90,
+    "type": "push",
+    "focus": "hypertrophy",
+    "muscle_groups": ["Chest","Shoulders","Triceps"],
+    "warmup": ["Band pull-aparts 2x15", "Light cable fly 2x15"],
+    "exercises": ["DB Incline Press 4x10-12 @ 70lbs", "Cable lateral raise 3x15 @ 20lbs", "Overhead tricep ext 3x12 @ 50lbs", "Face pulls 3x15"],
+    "finisher": {"name": "Lateral raise dropset", "description": "3 weights back to back no rest"},
+    "notes": "protect left pec"
   }
 }
-
-// ─── History builder ──────────────────────────────────────────────────────────
+Sunday = active_recovery only. Be concise: 3-4 morning exercises, 4-6 afternoon exercises, 2-3 warmup items.`
 
 function buildHistory(logs) {
   const now = Date.now()
@@ -41,8 +51,7 @@ function buildHistory(logs) {
     sessions: wLogs.filter(l => l.pm_exercises?.length > 0).length,
     avg_feel: (wLogs.reduce((s, l) => s + (l.overall_feel || 0), 0) / wLogs.length).toFixed(1),
     avg_sleep: (wLogs.reduce((s, l) => s + (l.sleep_hours || 0), 0) / wLogs.length).toFixed(1),
-    soreness_flags: [...new Set(wLogs.flatMap(l => Object.keys(l.soreness || {})))],
-    adjustment_notes: wLogs.filter(l => l.adjustment_note).map(l => l.adjustment_note),
+    notable_notes: wLogs.filter(l => l.pm_notes || l.morning_notes).map(l => l.pm_notes || l.morning_notes).filter(Boolean).slice(0, 3),
   }))
 
   const weights = {}
@@ -51,7 +60,7 @@ function buildHistory(logs) {
       log.pm_exercises.forEach(ex => {
         if (ex.weight && ex.name) {
           if (!weights[ex.name] || new Date(log.date) > new Date(weights[ex.name].date)) {
-            weights[ex.name] = { weight: ex.weight, reps: ex.reps, sets: ex.sets, date: log.date }
+            weights[ex.name] = { weight: ex.weight, reps: ex.reps || ex.actual_reps, date: log.date }
           }
         }
       })
@@ -60,34 +69,6 @@ function buildHistory(logs) {
 
   return { recent, summaries, weights }
 }
-
-// ─── Week prompt ──────────────────────────────────────────────────────────────
-
-const DAY_SCHEMA = `Each day must follow this structure:
-{
-  "label": "Monday - Push Day",
-  "day_type": "training",
-  "morning": {
-    "label": "Hip Mobility + Kickboxing",
-    "duration_min": 30,
-    "type": "mobility",
-    "focus": "hip flexors, glute activation",
-    "exercises": [{"name":"90/90 Hip Stretch","sets":3,"reps":"60s each side","notes":"keep spine tall"}],
-    "notes": "one coaching tip"
-  },
-  "afternoon": {
-    "label": "Push - Chest, Shoulders, Triceps",
-    "duration_min": 90,
-    "type": "push",
-    "focus": "hypertrophy",
-    "muscle_groups": ["Chest","Shoulders","Triceps"],
-    "warmup": [{"name":"Band pull-aparts","duration":"2 sets of 15"}],
-    "exercises": [{"name":"DB Incline Press","sets":4,"reps":"10-12","weight_suggestion":"70lbs RPE 7","notes":"control eccentric"}],
-    "finisher": {"name":"Cable lateral raise dropset","description":"3 weights back to back"},
-    "notes": "one coaching tip"
-  }
-}
-Sunday = active_recovery. Be concise: 3-4 morning exercises, 4-6 afternoon exercises, 2-3 warmup items.`
 
 function buildWeekPrompt(profile, weekStart, logs) {
   const { recent, summaries, weights } = buildHistory(logs)
@@ -102,261 +83,331 @@ function buildWeekPrompt(profile, weekStart, logs) {
     days.push({ date: d.toISOString().split('T')[0], name: DAYS_FULL[d.getDay()] })
   }
 
-  const system = 'You are a personal AI fitness coach. Athlete profile:\n' + ATHLETE_PROFILE +
-    '\nCurrent weight: ' + profile.weight_lbs + 'lbs\nPhase: ' + phase.label + ' (Week ' + phaseWeek + ')' +
-    '\nActivity targets: Swim ' + (prefs.swim_per_week || 2) + 'x/week, Basketball ' + (prefs.basketball_per_week || 1) + 'x/week, Kickboxing ' + (prefs.kickboxing_per_week || 3) + 'x/week mornings.\n\n' +
+  // Compact recent logs — include ALL notes
+  const recentCompact = recent.map(l => ({
+    date: l.date,
+    sleep: l.sleep_hours,
+    feel: l.overall_feel,
+    morning: l.morning_done ? (l.morning_notes || l.morning_type || 'done') : 'skipped',
+    exercises: (l.pm_exercises || []).map(ex => ex.name + (ex.weight ? ' @' + ex.weight + 'lbs' : '') + (ex.completed === false ? ' (skipped)' : '') + (ex.note ? ' [' + ex.note + ']' : '')).filter(Boolean),
+    notes: [l.pm_notes, l.morning_notes].filter(Boolean).join(' | ') || null,
+  }))
+
+  const system = 'You are a personal AI fitness coach and nutritionist. Athlete profile:\n' + ATHLETE_PROFILE +
+    '\nCurrent weight: ' + profile.weight_lbs + 'lbs | Phase: ' + phase.label + ' Week ' + phaseWeek +
+    '\nSwim ' + (prefs.swim_per_week || 2) + 'x/week, Basketball ' + (prefs.basketball_per_week || 1) + 'x/week, Kickboxing ' + (prefs.kickboxing_per_week || 3) + 'x/week mornings.\n\n' +
     DAY_SCHEMA + '\n\nRESPOND ONLY WITH VALID JSON. Start with { end with }. No markdown.'
 
   const user = 'Generate a 7-day training plan for week starting ' + weekStart + '.\n\n' +
-    'RECENT LOGS (last 14 days):\n' + (recent.length > 0 ? JSON.stringify(recent.map(l => ({ date: l.date, sleep_hours: l.sleep_hours, overall_feel: l.overall_feel, morning_type: l.morning_type, pm_exercises: l.pm_exercises, pm_feel: l.pm_feel, soreness: l.soreness, adjustment_note: l.adjustment_note }))) : 'No history yet.') + '\n\n' +
-    'OLDER HISTORY SUMMARY:\n' + (summaries.length > 0 ? JSON.stringify(summaries) : 'None.') + '\n\n' +
-    'LAST LOGGED WEIGHTS (increase 2.5-5lbs or 1 rep for progressive overload):\n' + (Object.keys(weights).length > 0 ? JSON.stringify(weights) : 'None yet.') + '\n\n' +
-    'DAYS: ' + days.map(d => d.date + ' (' + d.name + ')').join(', ') + '\n\n' +
-    'RULES: Sunday = active recovery only. Never same muscle group consecutive days. Distribute swim ' + (prefs.swim_per_week || 2) + 'x, basketball ' + (prefs.basketball_per_week || 1) + 'x, kickboxing ' + (prefs.kickboxing_per_week || 3) + 'x morning. Hip mobility EVERY morning. Core 3+ days.\n\n' +
-    'Return: {"week_start":"' + weekStart + '","phase_note":"...","days":{"' + days[0].date + '":{day},"' + days[1].date + '":{day},"' + days[2].date + '":{day},"' + days[3].date + '":{day},"' + days[4].date + '":{day},"' + days[5].date + '":{day},"' + days[6].date + '":{day}}}'
+    'RECENT LOGS (last 14 days — all notes included for context):\n' +
+    JSON.stringify(recentCompact) + '\n\n' +
+    'WEEKLY SUMMARIES (older history):\n' +
+    (summaries.length ? JSON.stringify(summaries) : 'None yet.') + '\n\n' +
+    'LAST LOGGED WEIGHTS (for progressive overload — increase 2.5-5lbs or add 1 rep):\n' +
+    (Object.keys(weights).length ? JSON.stringify(weights) : 'None yet — suggest starting weights by RPE.') + '\n\n' +
+    'DAYS TO PLAN: ' + days.map(d => d.date + ' (' + d.name + ')').join(', ') + '\n\n' +
+    'RULES: Sunday active recovery only. Never same muscle group consecutive days. ' +
+    'Hip mobility EVERY morning. Core 3+ days. Account for any notes/injuries from recent logs.\n\n' +
+    'Return JSON with this exact structure:\n' +
+    '{\n' +
+    '  "week_start": "' + weekStart + '",\n' +
+    '  "phase_note": "one sentence on this week focus",\n' +
+    '  "days": {\n' +
+    '    "' + days[0].date + '": { label, day_type, morning, afternoon },\n' +
+    '    "' + days[1].date + '": { label, day_type, morning, afternoon },\n' +
+    '    "' + days[2].date + '": { label, day_type, morning, afternoon },\n' +
+    '    "' + days[3].date + '": { label, day_type, morning, afternoon },\n' +
+    '    "' + days[4].date + '": { label, day_type, morning, afternoon },\n' +
+    '    "' + days[5].date + '": { label, day_type, morning, afternoon },\n' +
+    '    "' + days[6].date + '": { label, day_type, morning, afternoon }\n' +
+    '  }\n' +
+    '}'
 
   return { system, user }
 }
 
+// ─── Exercise helpers ─────────────────────────────────────────────────────────
+
+function parseExerciseString(str) {
+  if (typeof str !== 'string') return { name: str?.name || '', planned: '', weight: '', reps: '' }
+  const weightMatch = str.match(/@\s*(\d+)\s*lbs?/i)
+  const setsRepsMatch = str.match(/(\d+)x([\d\-]+)/i)
+  const name = str.replace(/\s*\d+x[\d\-]+.*$/i, '').replace(/\s*@.*$/i, '').trim()
+  return {
+    name: name || str,
+    planned: str,
+    weight: weightMatch ? weightMatch[1] : '',
+    reps: setsRepsMatch ? setsRepsMatch[2] : '',
+  }
+}
+
+function initExercises(plan, log) {
+  const planExs = plan?.afternoon?.exercises || []
+  const logExs = log?.pm_exercises || []
+  return planExs.map((planEx, i) => {
+    const parsed = parseExerciseString(planEx)
+    const logEx = logExs.find(l => l.name && parsed.name && l.name.toLowerCase().startsWith(parsed.name.toLowerCase().slice(0, 6)))
+    return {
+      id: i,
+      name: parsed.name,
+      planned: parsed.planned,
+      weight: logEx?.weight || parsed.weight,
+      reps: logEx?.reps || logEx?.actual_reps || parsed.reps,
+      completed: logEx ? (logEx.completed ?? true) : false,
+      note: logEx?.note || '',
+    }
+  })
+}
+
 // ─── Components ───────────────────────────────────────────────────────────────
 
-function ExerciseList({ exercises, color }) {
+function ExerciseDisplay({ exercises, color }) {
   if (!exercises?.length) return null
   return (
     <div>
-      {exercises.map((ex, i) => {
-        const isString = typeof ex === 'string'
-        return (
-          <div key={i} style={{ marginBottom: 12, paddingBottom: 12, borderBottom: i < exercises.length - 1 ? '1px solid ' + C.surfaceAlt : 'none' }}>
-            {isString ? (
-              <div style={{ fontSize: 14, color: C.text }}>{ex}</div>
-            ) : (
-              <>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                  <div style={{ fontWeight: 600, fontSize: 14, flex: 1, paddingRight: 8 }}>{ex.name}</div>
-                  <div style={{ fontSize: 12, color, fontWeight: 700, whiteSpace: 'nowrap' }}>{ex.sets} × {ex.reps}</div>
-                </div>
-                {ex.weight_suggestion && <div style={{ fontSize: 12, color: C.orange, marginTop: 3 }}>🏋 {ex.weight_suggestion}</div>}
-                {ex.notes && <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>{ex.notes}</div>}
-              </>
-            )}
-          </div>
-        )
-      })}
+      {exercises.map((ex, i) => (
+        <div key={i} style={{ fontSize: 13, color: C.text, padding: '6px 0', borderBottom: i < exercises.length - 1 ? '1px solid ' + C.surfaceAlt : 'none' }}>
+          {typeof ex === 'string' ? ex : ex.name}
+        </div>
+      ))}
     </div>
   )
 }
 
-function SessionCard({ session, colorBadge, label, icon, defaultOpen }) {
-  const [open, setOpen] = useState(defaultOpen || false)
+function SessionReadOnly({ session, colorBadge, label, icon }) {
+  const [open, setOpen] = useState(false)
   if (!session) return null
   return (
     <div className="card">
-      <div onClick={() => setOpen(!open)} style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div onClick={() => setOpen(!open)} style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
-            <span className="badge" style={{ background: colorBadge + '22', color: colorBadge, border: '1px solid ' + colorBadge + '44' }}>{icon} {label}</span>
-            <span style={{ fontSize: 12, color: C.muted }}>{session.duration_min}min</span>
-          </div>
-          <div style={{ fontWeight: 700, fontSize: 15 }}>{session.label}</div>
-          <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{session.focus}</div>
+          <span className="badge" style={{ background: colorBadge + '22', color: colorBadge, border: '1px solid ' + colorBadge + '44' }}>{icon} {label}</span>
+          <div style={{ fontWeight: 700, fontSize: 14, marginTop: 5 }}>{session.label}</div>
+          <div style={{ fontSize: 12, color: C.muted }}>{session.focus}</div>
         </div>
-        <span style={{ color: C.muted, fontSize: 20, marginTop: 2 }}>{open ? '↑' : '↓'}</span>
+        <span style={{ color: C.muted }}>{open ? '↑' : '↓'}</span>
       </div>
       {open && (
-        <div style={{ marginTop: 16, borderTop: '1px solid ' + C.border, paddingTop: 14 }}>
+        <div style={{ marginTop: 14, borderTop: '1px solid ' + C.border, paddingTop: 12 }}>
           {session.warmup?.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
+            <div style={{ marginBottom: 12 }}>
               <div className="section-title">Warmup</div>
-              {session.warmup.map((w, i) => (
-                <div key={i} style={{ fontSize: 13, color: '#aaa', marginBottom: 4 }}>
-                  {typeof w === 'string' ? '• ' + w : '• ' + w.name + ' — ' + w.duration}
-                </div>
-              ))}
+              {session.warmup.map((w, i) => <div key={i} style={{ fontSize: 12, color: '#aaa', marginBottom: 3 }}>• {typeof w === 'string' ? w : w.name + ' — ' + w.duration}</div>)}
             </div>
           )}
-          {session.exercises?.length > 0 && (
-            <>
-              {session.warmup?.length > 0 && <div className="section-title" style={{ marginBottom: 10 }}>Main Work</div>}
-              <ExerciseList exercises={session.exercises} color={colorBadge} />
-            </>
-          )}
+          <ExerciseDisplay exercises={session.exercises} color={colorBadge} />
           {session.finisher?.name && (
-            <div style={{ background: C.redSoft, border: '1px solid ' + C.red + '33', borderRadius: 10, padding: '10px 12px', marginTop: 8 }}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: C.red, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 }}>Finisher 🔥</div>
-              <div style={{ fontSize: 14, fontWeight: 700 }}>{session.finisher.name}</div>
-              <div style={{ fontSize: 12, color: '#aaa', marginTop: 3 }}>{session.finisher.description}</div>
+            <div style={{ background: C.redSoft, borderRadius: 8, padding: '8px 10px', marginTop: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.red, marginBottom: 3 }}>FINISHER 🔥</div>
+              <div style={{ fontSize: 13 }}>{session.finisher.name} — {session.finisher.description}</div>
             </div>
           )}
-          {session.notes && (
-            <div style={{ fontSize: 12, color: '#9c8fff', background: C.accentSoft, borderRadius: 8, padding: '8px 12px', marginTop: 12 }}>💬 {session.notes}</div>
-          )}
+          {session.notes && <div style={{ fontSize: 12, color: '#9c8fff', background: C.accentSoft, borderRadius: 8, padding: '8px 10px', marginTop: 10 }}>💬 {session.notes}</div>}
         </div>
       )}
     </div>
   )
 }
 
-function LogPanel({ date, log, dayPlan, onSave }) {
-  const existing = log || {}
-  const [sleep, setSleep] = useState(existing.sleep_hours?.toString() || '7')
-  const [energyAm, setEnergyAm] = useState(existing.energy_am?.toString() || '7')
-  const [morningDone, setMorningDone] = useState(existing.morning_done || false)
-  const [morningType, setMorningType] = useState(existing.morning_type || '')
-  const [morningFeel, setMorningFeel] = useState(existing.morning_feel?.toString() || '7')
-  const [morningNotes, setMorningNotes] = useState(existing.morning_notes || '')
-  const [exercises, setExercises] = useState(existing.pm_exercises || [])
-  const [pmType, setPmType] = useState(existing.pm_type || '')
-  const [pmFeel, setPmFeel] = useState(existing.pm_feel?.toString() || '7')
-  const [pmNotes, setPmNotes] = useState(existing.pm_notes || '')
-  const [soreness, setSoreness] = useState(existing.soreness || {})
-  const [overall, setOverall] = useState(existing.overall_feel?.toString() || '7')
-  const [adjustNote, setAdjustNote] = useState(existing.adjustment_note || '')
+// Combined plan + log view for a day
+function DayView({ date, plan, log, onSave, weekDates }) {
+  const today = todayStr()
+  const isToday = date === today
+  const isFuture = date > today
+
+  // key={date} on this component handles state reset between days
+
+  const [morningDone, setMorningDone] = useState(log?.morning_done || false)
+  const [morningNote, setMorningNote] = useState(log?.morning_notes || '')
+  const [exercises, setExercises] = useState(() => initExercises(plan, log))
+  const [sleep, setSleep] = useState(log?.sleep_hours?.toString() || '')
+  const [feel, setFeel] = useState(log?.overall_feel?.toString() || '7')
+  const [notes, setNotes] = useState(log?.pm_notes || '')
   const [saved, setSaved] = useState(false)
-  const [adding, setAdding] = useState(false)
-  const [newEx, setNewEx] = useState({ name: '', sets: '3', reps: '10', weight: '' })
+  const [saving, setSaving] = useState(false)
 
-  const bodyParts = ['Chest', 'Back', 'Shoulders', 'Biceps', 'Triceps', 'Legs', 'Core', 'Glutes', 'Hips']
-
-  function addEx() {
-    if (!newEx.name.trim()) return
-    setExercises([...exercises, { ...newEx }])
-    setNewEx({ name: '', sets: '3', reps: '10', weight: '' })
-    setAdding(false)
+  function updateEx(id, field, value) {
+    setExercises(exs => exs.map(ex => ex.id === id ? { ...ex, [field]: value } : ex))
   }
 
-  async function save() {
+  async function handleSave() {
+    setSaving(true)
+    const pm_exercises = exercises.map(ex => ({
+      name: ex.name,
+      planned: ex.planned,
+      weight: ex.weight,
+      reps: ex.reps,
+      completed: ex.completed,
+      note: ex.note,
+    }))
+
     const entry = {
-      date, sleep_hours: parseFloat(sleep), energy_am: parseInt(energyAm),
-      morning_done: morningDone, morning_type: morningType, morning_feel: parseInt(morningFeel),
-      morning_notes: morningNotes, pm_exercises: exercises, pm_type: pmType,
-      pm_feel: parseInt(pmFeel), pm_notes: pmNotes, overall_feel: parseInt(overall),
-      soreness, adjustment_note: adjustNote,
+      date,
+      sleep_hours: parseFloat(sleep) || null,
+      overall_feel: parseInt(feel) || null,
+      morning_done: morningDone,
+      morning_notes: morningNote,
+      pm_exercises,
+      pm_notes: notes,
     }
+
     await onSave(entry)
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
+    setSaving(false)
   }
 
-  const Slider = ({ label, value, onChange, color = C.accent }) => (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
-        <span className="label">{label}</span>
-        <span style={{ fontSize: 13, color, fontWeight: 700 }}>{value}/10</span>
+  if (isFuture) {
+    return (
+      <div>
+        <SessionReadOnly session={plan?.morning} colorBadge={C.orange} label="Morning" icon="🌅" />
+        <SessionReadOnly session={plan?.afternoon} colorBadge={C.accent} label="Afternoon" icon="🏋️" />
+        {!plan && <div className="card" style={{ textAlign: 'center', color: C.muted, padding: 24 }}>No plan yet for this day.</div>}
       </div>
-      <input type="range" min="1" max="10" value={value} onChange={e => onChange(e.target.value)} style={{ width: '100%', accentColor: color }} />
-    </div>
-  )
+    )
+  }
 
   return (
     <div>
+      {/* Morning */}
       <div className="card">
-        <div style={{ fontWeight: 700, fontSize: 14, color: '#9c8fff', marginBottom: 14 }}>😴 Sleep & Energy</div>
-        <div style={{ marginBottom: 14 }}>
-          <label className="label">Hours Slept</label>
-          <input className="input" type="number" step="0.5" value={sleep} onChange={e => setSleep(e.target.value)} style={{ width: 100 }} />
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+          <div>
+            <span className="badge" style={{ background: C.orangeSoft, color: C.orange, border: '1px solid ' + C.orange + '44' }}>🌅 Morning</span>
+            <div style={{ fontWeight: 700, fontSize: 14, marginTop: 5 }}>{plan?.morning?.label || 'Morning Session'}</div>
+            {plan?.morning?.focus && <div style={{ fontSize: 12, color: C.muted }}>{plan.morning.focus}</div>}
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', flexShrink: 0 }}>
+            <input type="checkbox" checked={morningDone} onChange={e => setMorningDone(e.target.checked)} style={{ width: 16, height: 16, accentColor: C.green }} />
+            <span style={{ fontSize: 12, color: morningDone ? C.green : C.muted }}>Done</span>
+          </label>
         </div>
-        <Slider label="Morning Energy" value={energyAm} onChange={setEnergyAm} color={C.orange} />
+
+        {plan?.morning?.exercises?.length > 0 && (
+          <div style={{ marginBottom: 12 }}>
+            <div className="section-title">Planned</div>
+            {plan.morning.exercises.map((ex, i) => (
+              <div key={i} style={{ fontSize: 12, color: '#aaa', padding: '4px 0', borderBottom: '1px solid ' + C.surfaceAlt }}>
+                {typeof ex === 'string' ? ex : ex.name}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div>
+          <label className="label">Notes (e.g. "swam instead", "hips felt tight", "skipped — tired")</label>
+          <input className="input" value={morningNote} onChange={e => setMorningNote(e.target.value)} placeholder="How did it go?" />
+        </div>
       </div>
 
+      {/* Afternoon */}
       <div className="card">
-        <div style={{ fontWeight: 700, fontSize: 14, color: C.orange, marginBottom: 14 }}>🌅 Morning Session</div>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14, cursor: 'pointer' }}>
-          <input type="checkbox" checked={morningDone} onChange={e => setMorningDone(e.target.checked)} style={{ width: 18, height: 18, accentColor: C.green }} />
-          <span style={{ fontSize: 14 }}>Completed morning session</span>
-        </label>
-        {morningDone && <>
+        <div style={{ marginBottom: 14 }}>
+          <span className="badge" style={{ background: C.accentSoft, color: C.accent, border: '1px solid ' + C.accent + '44' }}>🏋️ Afternoon</span>
+          <div style={{ fontWeight: 700, fontSize: 14, marginTop: 5 }}>{plan?.afternoon?.label || 'Afternoon Session'}</div>
+          {plan?.afternoon?.muscle_groups?.length > 0 && (
+            <div style={{ fontSize: 12, color: C.muted }}>{plan.afternoon.muscle_groups.join(', ')}</div>
+          )}
+        </div>
+
+        {plan?.afternoon?.warmup?.length > 0 && (
           <div style={{ marginBottom: 14 }}>
-            <label className="label">What did you do? (e.g. "swam 1km", "kickboxing 3 rounds", "hip mobility")</label>
-            <input className="input" value={morningType} onChange={e => setMorningType(e.target.value)} placeholder={dayPlan?.morning?.label || 'Describe session...'} />
+            <div className="section-title">Warmup</div>
+            {plan.afternoon.warmup.map((w, i) => (
+              <div key={i} style={{ fontSize: 12, color: '#aaa', padding: '3px 0' }}>
+                • {typeof w === 'string' ? w : w.name + ' — ' + w.duration}
+              </div>
+            ))}
           </div>
-          <Slider label="How did it feel?" value={morningFeel} onChange={setMorningFeel} color={C.orange} />
-          <label className="label">Notes</label>
-          <input className="input" value={morningNotes} onChange={e => setMorningNotes(e.target.value)} placeholder="e.g. hips felt tight..." />
-        </>}
-      </div>
+        )}
 
-      <div className="card">
-        <div style={{ fontWeight: 700, fontSize: 14, color: C.accent, marginBottom: 14 }}>🏋️ Afternoon Session</div>
-        <div style={{ marginBottom: 14 }}>
-          <label className="label">Session type (e.g. "push day", "swam laps", "basketball")</label>
-          <input className="input" value={pmType} onChange={e => setPmType(e.target.value)} placeholder={dayPlan?.afternoon?.label || 'What did you do?'} />
-        </div>
-        {exercises.map((ex, i) => (
-          <div key={i} className="card-alt" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <div>
-              <div style={{ fontWeight: 600, fontSize: 13 }}>{ex.name}</div>
-              <div style={{ fontSize: 12, color: C.accent }}>{ex.sets}×{ex.reps}{ex.weight ? ' @ ' + ex.weight + 'lbs' : ''}</div>
-            </div>
-            <button onClick={() => setExercises(exercises.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', color: C.red, cursor: 'pointer', fontSize: 20 }}>×</button>
-          </div>
-        ))}
-        {adding ? (
-          <div className="card-alt">
-            <div style={{ marginBottom: 10 }}>
-              <label className="label">Exercise</label>
-              <input className="input" placeholder="e.g. DB Incline Press" value={newEx.name} onChange={e => setNewEx({ ...newEx, name: e.target.value })} />
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 12 }}>
-              {[['Sets', 'sets'], ['Reps', 'reps'], ['lbs', 'weight']].map(([lbl, key]) => (
-                <div key={key}>
-                  <label className="label">{lbl}</label>
-                  <input className="input" type="number" value={newEx[key]} onChange={e => setNewEx({ ...newEx, [key]: e.target.value })} />
+        {exercises.length > 0 ? (
+          <div>
+            <div className="section-title">Exercises — tap to log</div>
+            {exercises.map(ex => (
+              <div key={ex.id} style={{
+                background: ex.completed ? C.accentSoft : C.surfaceAlt,
+                border: '1px solid ' + (ex.completed ? C.accent + '44' : C.subtle),
+                borderRadius: 12, padding: '10px 12px', marginBottom: 8, transition: 'all 0.15s'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: ex.completed ? 8 : 0 }}>
+                  <input type="checkbox" checked={ex.completed} onChange={e => updateEx(ex.id, 'completed', e.target.checked)}
+                    style={{ width: 18, height: 18, accentColor: C.accent, marginTop: 2, flexShrink: 0 }} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{ex.name}</div>
+                    {ex.planned && <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>Planned: {ex.planned}</div>}
+                  </div>
                 </div>
-              ))}
-            </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn-primary" onClick={addEx} style={{ margin: 0, flex: 1 }}>Add</button>
-              <button className="btn-secondary" onClick={() => setAdding(false)} style={{ margin: 0, flex: 1 }}>Cancel</button>
-            </div>
+                {ex.completed && (
+                  <div style={{ paddingLeft: 28 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+                      <div>
+                        <label className="label">Actual Weight (lbs)</label>
+                        <input className="input" type="number" value={ex.weight} onChange={e => updateEx(ex.id, 'weight', e.target.value)} placeholder="lbs" />
+                      </div>
+                      <div>
+                        <label className="label">Reps Done</label>
+                        <input className="input" value={ex.reps} onChange={e => updateEx(ex.id, 'reps', e.target.value)} placeholder="e.g. 12" />
+                      </div>
+                    </div>
+                    <input className="input" value={ex.note} onChange={e => updateEx(ex.id, 'note', e.target.value)}
+                      placeholder="Note (e.g. felt heavy, form broke down...)" />
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
         ) : (
-          <button className="btn-secondary" onClick={() => setAdding(true)}>+ Add Exercise</button>
-        )}
-        <Slider label="How did PM feel?" value={pmFeel} onChange={setPmFeel} />
-        <label className="label">Notes</label>
-        <input className="input" value={pmNotes} onChange={e => setPmNotes(e.target.value)} placeholder="e.g. shoulder felt strong..." style={{ marginBottom: 0 }} />
-      </div>
-
-      <div className="card">
-        <div style={{ fontWeight: 700, fontSize: 14, color: C.red, marginBottom: 14 }}>💢 Soreness Check</div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          {bodyParts.map(part => (
-            <button key={part} onClick={() => setSoreness(s => ({ ...s, [part]: s[part] ? undefined : 7 }))}
-              style={{ background: soreness[part] ? C.redSoft : C.surfaceAlt, border: '1px solid ' + (soreness[part] ? C.red : C.subtle), borderRadius: 20, padding: '6px 14px', fontSize: 12, color: soreness[part] ? C.red : C.muted, cursor: 'pointer', fontWeight: soreness[part] ? 700 : 400 }}>
-              {part}
-            </button>
-          ))}
-        </div>
-        {Object.entries(soreness).filter(([, v]) => v).map(([part]) => (
-          <div key={part} style={{ marginTop: 12 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-              <span style={{ fontSize: 12, color: C.muted }}>{part} soreness</span>
-              <span style={{ fontSize: 12, color: C.red, fontWeight: 700 }}>{soreness[part]}/10</span>
-            </div>
-            <input type="range" min="1" max="10" value={soreness[part]} onChange={e => setSoreness(s => ({ ...s, [part]: parseInt(e.target.value) }))} style={{ width: '100%', accentColor: C.red }} />
+          <div>
+            <label className="label">What did you do?</label>
+            <input className="input" value={notes} onChange={e => setNotes(e.target.value)} placeholder="e.g. push day, swam 1km, basketball..." />
           </div>
-        ))}
+        )}
+
+        {plan?.afternoon?.finisher?.name && (
+          <div style={{ background: C.redSoft, borderRadius: 8, padding: '8px 10px', marginTop: 8 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.red, marginBottom: 3 }}>FINISHER 🔥</div>
+            <div style={{ fontSize: 13 }}>{plan.afternoon.finisher.name} — {plan.afternoon.finisher.description}</div>
+          </div>
+        )}
       </div>
 
-      <div className="card" style={{ background: C.yellowSoft, border: '1px solid ' + C.yellow + '33' }}>
-        <div style={{ fontWeight: 700, fontSize: 14, color: C.yellow, marginBottom: 6 }}>⚡ Adjustment Flag</div>
-        <div style={{ fontSize: 12, color: C.muted, marginBottom: 10 }}>
-          Did something happen that should change the rest of this week? After saving, you can confirm the adjustment.
-        </div>
-        <textarea className="input" value={adjustNote} onChange={e => setAdjustNote(e.target.value)}
-          placeholder="e.g. swam 2km this morning, legs are wrecked — push leg day back&#10;e.g. tweaked left ankle, avoid jumping&#10;e.g. felt incredible, ready to push harder"
-          style={{ height: 80, resize: 'none' }} />
-      </div>
-
+      {/* Day summary */}
       <div className="card">
-        <div style={{ fontWeight: 700, fontSize: 14, color: C.green, marginBottom: 14 }}>🌟 Overall Day</div>
-        <Slider label="Overall Feel" value={overall} onChange={setOverall} color={C.green} />
+        <div style={{ fontWeight: 700, fontSize: 14, color: C.muted, marginBottom: 14 }}>📋 Day Summary</div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+          <div>
+            <label className="label">Sleep (hours)</label>
+            <input className="input" type="number" step="0.5" value={sleep} onChange={e => setSleep(e.target.value)} placeholder="7.5" />
+          </div>
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              <label className="label">Overall Feel</label>
+              <span style={{ fontSize: 13, color: C.green, fontWeight: 700 }}>{feel}/10</span>
+            </div>
+            <input type="range" min="1" max="10" value={feel} onChange={e => setFeel(e.target.value)} style={{ width: '100%', accentColor: C.green }} />
+          </div>
+        </div>
+
+        <div>
+          <label className="label">Notes — injuries, energy, what was different, anything to flag</label>
+          <textarea className="input" value={notes} onChange={e => setNotes(e.target.value)}
+            placeholder="e.g. left shoulder felt off on pressing, might need to take it easy tomorrow&#10;e.g. swam 2km this morning so legs were tired&#10;e.g. crushed it today, ready to push harder this week"
+            style={{ height: 80, resize: 'none', marginBottom: 0 }} />
+        </div>
       </div>
+
+      {log?.overall_feel && (
+        <div className="card" style={{ background: C.greenSoft, border: '1px solid ' + C.green + '33' }}>
+          <div style={{ fontSize: 12, color: C.green }}>✓ Previously logged — saving will update this entry</div>
+        </div>
+      )}
 
       <div style={{ padding: '0 16px' }}>
-        <button className="btn-primary" onClick={save} style={{ background: saved ? C.green : C.accent }}>
-          {saved ? '✓ Saved!' : 'Save Log'}
+        <button className="btn-primary" onClick={handleSave} disabled={saving}
+          style={{ background: saved ? C.green : C.accent }}>
+          {saving ? 'Saving...' : saved ? '✓ Saved!' : isToday ? 'Save Today\'s Log' : 'Save Log'}
         </button>
       </div>
     </div>
@@ -372,12 +423,10 @@ export default function WeekScreen({ profile }) {
   const [weekPlan, setWeekPlan] = useState(null)
   const [logs, setLogs] = useState({})
   const [selectedDate, setSelectedDate] = useState(today)
-  const [selectedLog, setSelectedLog] = useState(null)
   const [generating, setGenerating] = useState(false)
   const [adjusting, setAdjusting] = useState(false)
   const [adjustProgress, setAdjustProgress] = useState('')
   const [error, setError] = useState(null)
-  const [tab, setTab] = useState('plan')
   const [pendingAdjustment, setPendingAdjustment] = useState(null)
   const [adjustmentResult, setAdjustmentResult] = useState(null)
 
@@ -389,7 +438,6 @@ export default function WeekScreen({ profile }) {
   }
 
   useEffect(() => { loadWeek() }, [])
-  useEffect(() => { loadLog(selectedDate) }, [selectedDate])
 
   async function loadWeek() {
     const [plan, weekLogs] = await Promise.all([getWeekPlan(weekStart), getLogsForWeek(weekStart)])
@@ -399,18 +447,13 @@ export default function WeekScreen({ profile }) {
     setLogs(logMap)
   }
 
-  async function loadLog(date) {
-    const log = await getLog(date)
-    setSelectedLog(log)
-  }
-
   async function generateWeek() {
     setGenerating(true)
     setError(null)
     try {
       const allLogs = await getRecentLogs(60)
       const { system, user } = buildWeekPrompt(profile, weekStart, allLogs)
-      const raw = await callAI(system, user, 7000)
+      const raw = await callAI(system, user, 8000)
       const data = repairAndParseJSON(raw)
       const phase = PHASES.find(p => p.id === profile.phase) || PHASES[0]
       await saveWeekPlan(weekStart, data.days, phase.label, getPhaseWeek(profile.phase_start))
@@ -427,15 +470,14 @@ export default function WeekScreen({ profile }) {
     setError(null)
 
     const remainingDays = weekDates.filter(d => d > today)
-    if (remainingDays.length === 0) { setAdjusting(false); return }
+    if (!remainingDays.length) { setAdjusting(false); return }
 
     const logsThisWeek = Object.values(logs)
     const logSummary = logsThisWeek.map(l => ({
       date: l.date,
-      morning: l.morning_type,
-      pm: l.pm_type,
-      soreness: Object.keys(l.soreness || {}).filter(k => (l.soreness[k] || 0) > 4),
-      feel: l.overall_feel
+      morning: l.morning_done ? (l.morning_notes || 'done') : 'skipped',
+      feel: l.overall_feel,
+      notes: l.pm_notes || null,
     }))
 
     let updatedDays = { ...weekPlan.days }
@@ -446,40 +488,18 @@ export default function WeekScreen({ profile }) {
       setAdjustProgress('Adjusting ' + dayName + '...')
 
       const orig = weekPlan.days?.[date]
-      const origInfo = orig
-        ? (orig.label + ', morning: ' + (orig.morning?.type || 'mobility') + ', afternoon: ' + (orig.afternoon?.type || 'training') + ', muscles: ' + (orig.afternoon?.muscle_groups || []).join(', '))
-        : 'no original plan'
+      const origInfo = orig ? orig.label + ', morning: ' + (orig.morning?.type || 'mobility') + ', afternoon: ' + (orig.afternoon?.type || 'training') + ', muscles: ' + (orig.afternoon?.muscle_groups || []).join(', ') : 'no plan'
 
-      const systemPrompt = 'You are a personal AI fitness coach. ' + ATHLETE_PROFILE +
-        ' CRITICAL: Respond with ONLY valid JSON. No markdown, no explanation. Start with { end with }.'
-
-      const userPrompt = 'Generate an adjusted workout plan for ' + date + ' (' + dayName + ').\n' +
-        'ADJUSTMENT REASON: "' + note + '"\n' +
-        'DONE THIS WEEK: ' + JSON.stringify(logSummary) + '\n' +
-        'ORIGINAL PLAN FOR TODAY: ' + origInfo + '\n\n' +
-        'Return a single JSON object with this exact structure (exercises MUST be plain strings, not objects):\n' +
-        '{\n' +
-        '  "label": "' + dayName + ' - [session name]",\n' +
-        '  "day_type": "training",\n' +
-        '  "morning": {\n' +
-        '    "label": "session name",\n' +
-        '    "duration_min": 30,\n' +
-        '    "focus": "focus area",\n' +
-        '    "exercises": ["Exercise name 3x10", "Exercise name 3x60s each side"],\n' +
-        '    "notes": "one tip"\n' +
-        '  },\n' +
-        '  "afternoon": {\n' +
-        '    "label": "session name",\n' +
-        '    "duration_min": 90,\n' +
-        '    "focus": "focus area",\n' +
-        '    "muscle_groups": ["Group1", "Group2"],\n' +
-        '    "exercises": ["Exercise 4x10-12 @ 70lbs", "Exercise 3x8-10", "Exercise 3x15"],\n' +
-        '    "notes": "one tip"\n' +
-        '  }\n' +
-        '}'
+      const sys = 'You are a personal AI fitness coach. ' + ATHLETE_PROFILE + ' Respond ONLY with valid JSON. Start with { end with }. No markdown.'
+      const usr = 'Adjusted plan for ' + date + ' (' + dayName + ').\n' +
+        'Reason: "' + note + '"\n' +
+        'Week logs: ' + JSON.stringify(logSummary) + '\n' +
+        'Original: ' + origInfo + '\n\n' +
+        'Return ONE JSON object. Exercises as plain strings:\n' +
+        '{"label":"' + dayName + ' - session","day_type":"training","morning":{"label":"","duration_min":30,"focus":"","exercises":["Ex 3x10","Ex 3x60s"],"notes":""},"afternoon":{"label":"","duration_min":90,"focus":"","muscle_groups":["G1"],"exercises":["Ex 4x10-12 @ 70lbs","Ex 3x8-10"],"notes":""}}'
 
       try {
-        const raw = await callAI(systemPrompt, userPrompt, 2000)
+        const raw = await callAI(sys, usr, 2000)
         const dayPlan = repairAndParseJSON(raw)
         updatedDays[date] = dayPlan
         successCount++
@@ -494,28 +514,53 @@ export default function WeekScreen({ profile }) {
       try {
         await saveWeekPlan(weekStart, updatedDays, weekPlan.phase, weekPlan.phase_week)
         setWeekPlan(p => ({ ...p, days: updatedDays }))
-        setAdjustmentResult(
-          successCount === remainingDays.length
-            ? 'All ' + successCount + ' remaining days adjusted. Tap the day tabs to see changes.'
-            : successCount + ' of ' + remainingDays.length + ' days adjusted successfully.'
-        )
+        setAdjustmentResult('Week adjusted — ' + successCount + ' day' + (successCount > 1 ? 's' : '') + ' updated. Tap the day tabs to see changes.')
       } catch (e) {
         setError('Adjusted but failed to save: ' + e.message)
       }
     } else {
       setError('Could not adjust any days. Your original plan is intact.')
     }
-
     setAdjusting(false)
+  }
+
+  async function inferAdjustment(entry) {
+    const remainingDays = weekDates.filter(d => d > today)
+    if (!remainingDays.length || !weekPlan) return
+
+    const hasNotes = entry.pm_notes?.trim()
+    const hasExerciseNotes = (entry.pm_exercises || []).some(ex => ex.note)
+    const hasSkippedExercises = (entry.pm_exercises || []).some(ex => ex.completed === false)
+
+    if (!hasNotes && !hasExerciseNotes && !hasSkippedExercises) return
+
+    const summary = [
+      entry.pm_notes ? 'Notes: ' + entry.pm_notes : '',
+      entry.morning_notes ? 'Morning notes: ' + entry.morning_notes : '',
+      hasExerciseNotes ? 'Exercise notes: ' + (entry.pm_exercises || []).filter(e => e.note).map(e => e.name + ': ' + e.note).join(', ') : '',
+      hasSkippedExercises ? 'Skipped: ' + (entry.pm_exercises || []).filter(e => !e.completed).map(e => e.name).join(', ') : '',
+    ].filter(Boolean).join('\n')
+
+    try {
+      const sys = 'You are a personal trainer reading a training log. Respond ONLY with valid JSON. Start with { end with }.'
+      const usr = 'Training log for today:\n' + summary + '\n\nRemaining days this week: ' + remainingDays.join(', ') + '\n\nShould any remaining days be adjusted? Reply:\n{"needs_adjustment": true, "reason": "one sentence", "suggestion": "one specific sentence what to change"}\nOR\n{"needs_adjustment": false}'
+
+      const raw = await callAI(sys, usr, 300)
+      const decision = repairAndParseJSON(raw)
+      if (decision.needs_adjustment) {
+        setPendingAdjustment(decision)
+      }
+    } catch (e) {
+      // Silent fail — inference is optional
+      console.log('Inference failed silently:', e.message)
+    }
   }
 
   async function handleSaveLog(entry) {
     await saveLog(entry)
     setLogs(l => ({ ...l, [entry.date]: entry }))
-    setSelectedLog(entry)
-    if (entry.adjustment_note?.trim() && weekPlan && weekDates.filter(d => d > today).length > 0) {
-      setPendingAdjustment(entry.adjustment_note)
-    }
+    // Run inference silently — show banner if adjustment needed
+    inferAdjustment(entry)
   }
 
   const isSunday = new Date().getDay() === 0
@@ -570,20 +615,19 @@ export default function WeekScreen({ profile }) {
       </div>
 
       <div style={{ paddingTop: 16 }}>
-
+        {/* Status banners */}
         {pendingAdjustment && !adjusting && (
           <div className="card" style={{ background: C.yellowSoft, border: '1px solid ' + C.yellow + '44' }}>
-            <div style={{ fontWeight: 700, fontSize: 14, color: C.yellow, marginBottom: 8 }}>⚡ Adjustment Flagged</div>
-            <div style={{ fontSize: 13, color: '#ddd', marginBottom: 4, fontStyle: 'italic' }}>"{pendingAdjustment}"</div>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
-              Rebuild remaining {weekDates.filter(d => d > today).length} days based on this? Takes ~30 seconds.
-            </div>
+            <div style={{ fontWeight: 700, fontSize: 13, color: C.yellow, marginBottom: 6 }}>⚡ Trainer Recommendation</div>
+            <div style={{ fontSize: 13, color: '#ddd', marginBottom: 4 }}>{pendingAdjustment.reason}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>{pendingAdjustment.suggestion}</div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn-primary" onClick={() => runAdjustment(pendingAdjustment)} style={{ margin: 0, flex: 1, background: C.yellow, color: '#000' }}>
-                Yes, adjust my week
+              <button className="btn-primary" onClick={() => runAdjustment(pendingAdjustment.reason + ' ' + pendingAdjustment.suggestion)}
+                style={{ margin: 0, flex: 1, background: C.yellow, color: '#000', fontSize: 13 }}>
+                Adjust my week
               </button>
-              <button className="btn-secondary" onClick={() => setPendingAdjustment(null)} style={{ margin: 0, flex: 1 }}>
-                No thanks
+              <button className="btn-secondary" onClick={() => setPendingAdjustment(null)} style={{ margin: 0, flex: 1, fontSize: 13 }}>
+                Keep as is
               </button>
             </div>
           </div>
@@ -599,8 +643,7 @@ export default function WeekScreen({ profile }) {
 
         {adjustmentResult && (
           <div className="card" style={{ background: C.greenSoft, border: '1px solid ' + C.green + '44' }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: C.green, marginBottom: 6 }}>✓ WEEK ADJUSTED</div>
-            <div style={{ fontSize: 13, color: '#ddd', marginBottom: 8 }}>{adjustmentResult}</div>
+            <div style={{ fontSize: 12, color: C.green, marginBottom: 6 }}>✓ {adjustmentResult}</div>
             <button onClick={() => setAdjustmentResult(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 11, cursor: 'pointer', padding: 0 }}>Dismiss</button>
           </div>
         )}
@@ -609,12 +652,8 @@ export default function WeekScreen({ profile }) {
           <div className="card" style={{ textAlign: 'center', padding: '28px 18px', background: isSunday ? C.accentSoft : undefined, border: isSunday ? '1px solid ' + C.accent + '44' : undefined }}>
             <div style={{ fontSize: 32, marginBottom: 12 }}>{isSunday ? '📅' : '🤖'}</div>
             <div style={{ fontWeight: 700, marginBottom: 6 }}>{isSunday ? "It's Sunday — Generate This Week" : 'No Plan for This Week'}</div>
-            <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>
-              AI will plan your full week using your last 60 days of history.
-            </div>
-            <button className="btn-primary" onClick={generateWeek} style={{ width: 'auto', padding: '12px 28px', marginBottom: 0 }}>
-              Generate Week ⚡
-            </button>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 20 }}>AI will plan your full week using your last 60 days of history.</div>
+            <button className="btn-primary" onClick={generateWeek} style={{ width: 'auto', padding: '12px 28px', marginBottom: 0 }}>Generate Week ⚡</button>
           </div>
         )}
 
@@ -628,8 +667,8 @@ export default function WeekScreen({ profile }) {
         {error && (
           <div className="card" style={{ background: C.redSoft, border: '1px solid ' + C.red + '44' }}>
             <div style={{ fontSize: 13, color: C.red, marginBottom: 6 }}>⚠️ {error}</div>
-            <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>Your existing plan is still saved and intact.</div>
-            <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 12, cursor: 'pointer', padding: 0 }}>Dismiss</button>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>Your existing plan is safe.</div>
+            <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 11, cursor: 'pointer', padding: 0 }}>Dismiss</button>
           </div>
         )}
 
@@ -639,52 +678,27 @@ export default function WeekScreen({ profile }) {
           </div>
         )}
 
+        {/* Day header */}
         {weekPlan && (
-          <>
-            <div style={{ padding: '0 16px 4px' }}>
-              <div style={{ fontWeight: 800, fontSize: 16 }}>
-                {new Date(selectedDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
-                {selectedDate === today && <span style={{ fontSize: 12, color: C.accent, marginLeft: 8 }}>· Today</span>}
-              </div>
-              {selectedDay?.label && <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{selectedDay.label}</div>}
+          <div style={{ padding: '4px 16px 8px' }}>
+            <div style={{ fontWeight: 800, fontSize: 16 }}>
+              {new Date(selectedDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
+              {selectedDate === today && <span style={{ fontSize: 12, color: C.accent, marginLeft: 8 }}>· Today</span>}
             </div>
+            {selectedDay?.label && <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{selectedDay.label}</div>}
+          </div>
+        )}
 
-            <div style={{ display: 'flex', gap: 8, padding: '8px 16px 4px' }}>
-              {['plan', 'log'].map(t => (
-                <button key={t} onClick={() => setTab(t)} style={{
-                  flex: 1, background: tab === t ? C.accent : C.surfaceAlt, color: tab === t ? '#fff' : C.muted,
-                  border: 'none', borderRadius: 10, padding: '8px 0', fontSize: 13, fontWeight: 600, cursor: 'pointer'
-                }}>
-                  {t === 'plan' ? '📋 Plan' : '✏️ Log'}
-                </button>
-              ))}
-            </div>
-
-            {tab === 'plan' && (
-              <>
-                {logs[selectedDate]?.overall_feel && (
-                  <div className="card" style={{ background: C.greenSoft, border: '1px solid ' + C.green + '44' }}>
-                    <div style={{ fontSize: 12, color: C.green }}>
-                      ✓ Logged · Feel: {logs[selectedDate].overall_feel}/10
-                      {logs[selectedDate].pm_type ? ' · ' + logs[selectedDate].pm_type : ''}
-                    </div>
-                  </div>
-                )}
-                {selectedDay ? (
-                  <>
-                    <SessionCard session={selectedDay.morning} colorBadge={C.orange} label="Morning" icon="🌅" />
-                    <SessionCard session={selectedDay.afternoon} colorBadge={C.accent} label="Afternoon" icon="🏋️" defaultOpen={selectedDate === today} />
-                  </>
-                ) : (
-                  <div className="card" style={{ textAlign: 'center', color: C.muted, padding: '24px 18px' }}>No plan for this day.</div>
-                )}
-              </>
-            )}
-
-            {tab === 'log' && (
-              <LogPanel date={selectedDate} log={logs[selectedDate] || selectedLog} dayPlan={selectedDay} onSave={handleSaveLog} />
-            )}
-          </>
+        {/* Combined plan + log — key={selectedDate} resets state between days */}
+        {weekPlan && (
+          <DayView
+            key={selectedDate}
+            date={selectedDate}
+            plan={selectedDay}
+            log={logs[selectedDate]}
+            onSave={handleSaveLog}
+            weekDates={weekDates}
+          />
         )}
       </div>
     </div>
